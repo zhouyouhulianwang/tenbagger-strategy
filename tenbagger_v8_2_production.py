@@ -1377,6 +1377,30 @@ class PortfolioConstructor:
         
         return dict(sorted(combined.items(), key=lambda x: x[1]['total'], reverse=True))
     
+    def filter_21d_high(self, signals: Dict[str, Dict], prices: pd.DataFrame,
+                        t: int, threshold: float = 0.8) -> Dict[str, Dict]:
+        """
+        调仓过滤: 排除跌破21日高点threshold的个股。
+        默认threshold=0.8: 距离21日高点回撤超过20%的个股被排除出调仓候选池。
+        已持仓个股不受此过滤影响(由独立止损逻辑管理)。
+        """
+        if not signals or t < 21:
+            return signals
+        filtered = {}
+        for sym, data in signals.items():
+            if sym in prices.columns:
+                high_21d = prices[sym].iloc[t-21:t+1].max()
+                current = prices[sym].iloc[t]
+                if high_21d > 0 and current >= high_21d * threshold:
+                    filtered[sym] = data
+                else:
+                    logger.info(f"FILTER-21DHIGH: {sym} EXCLUDED "
+                               f"(price=${current:.2f}, 21d-high=${high_21d:.2f}, "
+                               f"ratio={current/high_21d:.1%} < {threshold:.0%})")
+            else:
+                filtered[sym] = data
+        return filtered
+    
     # HP-007 FIX: Removed unused `fundamentals` parameter
     def allocate(self, signals: Dict[str, Dict], capital: float, prices: pd.DataFrame,
                  t: int) -> Dict[str, int]:
@@ -1430,12 +1454,27 @@ class HedgeEngine:
     Research: Permanent hedge costs 9%/yr; conditional hedge Sharpe 2.56, DD -23.2%.
     """
     
-    def __init__(self, config: Config = None):
+    def __init__(self, config: Config = None, client: AlpacaClient = None):
         self.config = config or Config()
-        self._hedge_active = False       # Current hedge state
         self._switches_today = 0         # Daily switch counter
         self._last_switch_date = None    # Track date for daily reset
         self._circuit_broken = False     # Daily circuit breaker flag
+        # Sync hedge state with existing SQQQ position on startup
+        self._hedge_active = self._sync_hedge_state(client)
+    
+    def _sync_hedge_state(self, client: AlpacaClient = None) -> bool:
+        """On startup, check if SQQQ position exists → set _hedge_active accordingly."""
+        if client is None:
+            return False
+        try:
+            for p in client.get_positions():
+                if p['symbol'] == self.config.HEDGE_ETF and float(p['qty']) > 0:
+                    logger.warning(f"HEDGE SYNC: Found existing {p['qty']} {self.config.HEDGE_ETF} "
+                                  f"on startup → setting _hedge_active=True")
+                    return True
+        except Exception:
+            pass
+        return False
     
     def _get_vix_level(self, client: AlpacaClient) -> float:
         """
@@ -1522,53 +1561,91 @@ class HedgeEngine:
         """Return stock position factor (0.9 when hedged, 1.0 otherwise)."""
         return self.config.HEDGE_STOCK_COMPRESSION if self._hedge_active else 1.0
     
+    def _check_buying_power(self, client: AlpacaClient, required: float) -> bool:
+        """Check if account has sufficient buying power."""
+        try:
+            acct = client.get_account()
+            bp = float(acct.get('buying_power', 0))
+            cash = float(acct.get('cash', 0))
+            # Require both buying power and positive cash cushion
+            return bp >= required and cash >= required * 0.5
+        except Exception:
+            return False
+    
+    def _submit_notional_order(self, client: AlpacaClient, symbol: str, 
+                                notional: float, side: str) -> Optional[Dict]:
+        """Submit order using notional (dollar amount) instead of qty."""
+        try:
+            headers = client.secure.get_headers()
+            data = {
+                'symbol': symbol,
+                'notional': str(notional),  # Dollar amount, not shares
+                'side': side,
+                'type': 'market',
+                'time_in_force': 'ioc',
+                'client_order_id': f"{client.ORDER_PREFIX}{symbol}_{side}_{int(time.time())}_{os.urandom(4).hex()}",
+            }
+            r = requests.post(f"{client.config.ALPACA_BASE_URL}/v2/orders",
+                            headers=headers, json=data, timeout=client.config.API_TIMEOUT)
+            if r.status_code in (200, 201):
+                return r.json()
+            logger.error(f"Notional order failed: HTTP {r.status_code} {r.text[:200]}")
+        except Exception as e:
+            logger.error(f"Notional order exception: {e}")
+        return None
+    
     def execute(self, client: AlpacaClient, equity: float, action: str) -> Dict[str, Any]:
         """
-        Execute hedge action with market order (real-time).
-        Returns execution summary.
+        Execute hedge action with notional market order + buying power check.
+        Uses notional (dollar amount) instead of qty to prevent accumulation errors.
         """
         results = {'action': action, 'executed': False, 'details': []}
         hedge_sym = self.config.HEDGE_ETF
         
         try:
             if action == 'activate':
-                # Buy SQQQ with market order
-                bars = client.get_bars(hedge_sym, days=2)
-                if len(bars) == 0:
+                notional = equity * self.config.HEDGE_POSITION_PCT
+                if notional < 100:
+                    logger.warning(f"HEDGE: notional ${notional:.2f} too small, skipping")
                     return results
-                price = float(bars.iloc[-1])
-                qty = int(equity * self.config.HEDGE_POSITION_PCT / price)
-                if qty > 0:
-                    order = client.submit_order(hedge_sym, qty, 'buy',
-                                               order_type='market', tif='ioc')
-                    if order and order.get('status') in ('filled', 'accepted', 'new'):
-                        results['executed'] = True
-                        results['details'].append({'symbol': hedge_sym, 'side': 'buy',
-                                                    'qty': qty, 'type': 'market'})
-                        logger.critical(f"HEDGE ACTIVATED: BOUGHT {qty} {hedge_sym} @ market "
-                                       f"(VIX>={self.config.HEDGE_VIX_ACTIVATE})")
-                    else:
-                        logger.error(f"HEDGE ACTIVATE FAILED: order rejected")
+                
+                # Check buying power before ordering
+                if not self._check_buying_power(client, notional):
+                    logger.error(f"HEDGE ACTIVATE: Insufficient buying power for ${notional:.2f}")
+                    return results
+                
+                # Use notional order (dollar amount) for precise position sizing
+                order = self._submit_notional_order(client, hedge_sym, notional, 'buy')
+                if order and order.get('status') in ('filled', 'accepted', 'new'):
+                    filled_qty = order.get('filled_qty') or order.get('qty', '0')
+                    results['executed'] = True
+                    results['details'].append({'symbol': hedge_sym, 'side': 'buy',
+                                                'notional': notional, 'filled_qty': filled_qty})
+                    logger.critical(f"HEDGE ACTIVATED: BOUGHT ${notional:.0f} {hedge_sym} "
+                                   f"(VIX>={self.config.HEDGE_VIX_ACTIVATE})")
+                else:
+                    logger.error(f"HEDGE ACTIVATE FAILED: order rejected")
             
             elif action == 'deactivate':
-                # Sell all SQQQ with market order
+                # Sell all SQQQ using notional close (negative notional)
                 positions = client.get_positions()
                 for p in positions:
                     if p['symbol'] == hedge_sym:
                         qty = int(float(p['qty']))
-                        if qty > 0:
+                        mv = float(p['market_value'])
+                        if qty > 0 and mv > 0:
+                            # Sell using qty (closing position)
                             order = client.submit_order(hedge_sym, qty, 'sell',
                                                        order_type='market', tif='ioc')
                             if order and order.get('status') in ('filled', 'accepted', 'new'):
                                 results['executed'] = True
                                 results['details'].append({'symbol': hedge_sym, 'side': 'sell',
-                                                            'qty': qty, 'type': 'market'})
-                                logger.critical(f"HEDGE DEACTIVATED: SOLD {qty} {hedge_sym} @ market "
+                                                            'qty': qty, 'market_value': mv})
+                                logger.critical(f"HEDGE DEACTIVATED: SOLD {qty} {hedge_sym} ${mv:.0f} "
                                                f"(VIX<={self.config.HEDGE_VIX_DEACTIVATE})")
                         break
             
             elif action == 'drift_rebalance':
-                # Rebalance existing hedge if drifted > 2%
                 target = self.calculate_hedge(equity)
                 results = self._rebalance_to_target(client, target, equity)
         
@@ -1820,9 +1897,10 @@ class BacktestEngine:
                 entry_prices = {}
                 max_prices_tracker = {}
                 
-                # Buy new positions
+                # Buy new positions (with 21d-high filter)
                 adjusted_capital = total_value * pos_factor
-                top_signals = dict(list(combined.items())[:self.config.MAX_POSITIONS])
+                top_signals = constructor.filter_21d_high(
+                    dict(list(combined.items())[:self.config.MAX_POSITIONS]), prices, t)
                 
                 for sym, signal in top_signals.items():
                     if sym not in exec_prices or exec_prices[sym] <= 0:
@@ -2091,7 +2169,7 @@ class IntradayMonitor:
         self.fundamentals = RealtimeFundamentals(config)
         self.constructor = PortfolioConstructor(config)
         self.macro = MacroTiming(config)
-        self.hedge = HedgeEngine(config)
+        self.hedge = HedgeEngine(config, self.client)
         
         self.entry_prices = {}
         self.max_prices = {}
@@ -2249,9 +2327,11 @@ class IntradayMonitor:
             defensive = DefensiveStrategy(self.fundamentals, self.config).select(prices, benchmark, t)
             
             combined = self.constructor.combine(mom, sector, growth, value, defensive, weights)
+            # 21日高点过滤: 排除跌破21日高点80%的个股(回撤超20%)
+            combined = self.constructor.filter_21d_high(combined, prices, t)
             signals = [s[0] for s in sorted(combined.items(), key=lambda x: x[1]['total'], reverse=True)[:self.config.MAX_POSITIONS]]
             
-            logger.info(f"Signals generated: {signals} | Regime: {regime}")
+            logger.info(f"Signals generated: {signals} | Regime: {regime} | 21d-high-filter: applied")
             
             # 确定目标持仓 (stock compression由盘中hedge引擎管理)
             acct = self.client.get_account()
