@@ -1401,6 +1401,30 @@ class PortfolioConstructor:
                 filtered[sym] = data
         return filtered
     
+    def filter_by_volatility(self, signals: Dict[str, Dict], prices: pd.DataFrame,
+                             t: int, max_vol: float = None) -> Dict[str, Dict]:
+        """
+        调仓阶段全局波动率过滤: 排除20日年化波动率超过max_vol的个股。
+        作用于combine()之后、allocate()之前, 覆盖所有策略的选股信号。
+        已持仓个股不受此过滤影响(由独立止损逻辑管理)。
+        """
+        if not signals or t < 20:
+            return signals
+        if max_vol is None:
+            max_vol = self.config.MAX_VOLATILITY
+        filtered = {}
+        for sym, data in signals.items():
+            if sym in prices.columns:
+                vol = prices[sym].iloc[max(0, t-20):t+1].pct_change().std() * np.sqrt(252)
+                if vol <= max_vol:
+                    filtered[sym] = data
+                else:
+                    logger.info(f"VOL-FILTER: {sym} EXCLUDED "
+                               f"(20d-vol={vol:.1%} > max={max_vol:.1%})")
+            else:
+                filtered[sym] = data
+        return filtered
+    
     # HP-007 FIX: Removed unused `fundamentals` parameter
     def allocate(self, signals: Dict[str, Dict], capital: float, prices: pd.DataFrame,
                  t: int) -> Dict[str, int]:
@@ -1759,7 +1783,7 @@ class BacktestEngine:
         
         # Init strategies
         mom_strat = MomentumStrategy(self.config)
-        sector_strat = SectorRotationStrategy(fundamentals, self.config)
+        # sector rotation disabled (user request)
         growth_strat = GrowthStrategy(fundamentals, self.config)
         value_strat = ValueStrategy(fundamentals, self.config)
         def_strat = DefensiveStrategy(fundamentals, self.config)
@@ -1862,13 +1886,13 @@ class BacktestEngine:
                 
                 # 5 strategies select
                 mom_picks = mom_strat.select(prices, benchmark, t)
-                sector_picks = sector_strat.select(prices, benchmark, t)
+                # sector rotation disabled
                 growth_picks = growth_strat.select(prices, benchmark, t)
                 value_picks = value_strat.select(prices, benchmark, t)
                 def_picks = def_strat.select(prices, benchmark, t)
                 
-                # Combine
-                combined = constructor.combine(mom_picks, sector_picks, growth_picks,
+                # Combine (4 strategies, sector={})
+                combined = constructor.combine(mom_picks, {}, growth_picks,
                                                value_picks, def_picks, weights)
                 
                 # Determine execution price
@@ -1897,10 +1921,12 @@ class BacktestEngine:
                 entry_prices = {}
                 max_prices_tracker = {}
                 
-                # Buy new positions (with 21d-high filter)
+                # 全局波动率过滤: 所有策略信号统一检查20日波动率
+                combined = constructor.filter_by_volatility(combined, prices, t)
+                
+                # Buy new positions
                 adjusted_capital = total_value * pos_factor
-                top_signals = constructor.filter_21d_high(
-                    dict(list(combined.items())[:self.config.MAX_POSITIONS]), prices, t)
+                top_signals = dict(list(combined.items())[:self.config.MAX_POSITIONS])
                 
                 for sym, signal in top_signals.items():
                     if sym not in exec_prices or exec_prices[sym] <= 0:
@@ -2321,17 +2347,17 @@ class IntradayMonitor:
             weights = self.macro.get_weights(regime)
             
             mom = MomentumStrategy(self.config).select(prices, benchmark, t)
-            sector = SectorRotationStrategy(self.fundamentals, self.config).select(prices, benchmark, t)
+            # sector rotation disabled (user request)
             growth = GrowthStrategy(self.fundamentals, self.config).select(prices, benchmark, t)
             value = ValueStrategy(self.fundamentals, self.config).select(prices, benchmark, t)
             defensive = DefensiveStrategy(self.fundamentals, self.config).select(prices, benchmark, t)
             
-            combined = self.constructor.combine(mom, sector, growth, value, defensive, weights)
-            # 21日高点过滤: 排除跌破21日高点80%的个股(回撤超20%)
-            combined = self.constructor.filter_21d_high(combined, prices, t)
+            combined = self.constructor.combine(mom, {}, growth, value, defensive, weights)
+            # 全局波动率过滤: 所有策略信号统一检查20日波动率
+            combined = self.constructor.filter_by_volatility(combined, prices, t)
             signals = [s[0] for s in sorted(combined.items(), key=lambda x: x[1]['total'], reverse=True)[:self.config.MAX_POSITIONS]]
             
-            logger.info(f"Signals generated: {signals} | Regime: {regime} | 21d-high-filter: applied")
+            logger.info(f"Signals generated: {signals} | Regime: {regime}")
             
             # 确定目标持仓 (stock compression由盘中hedge引擎管理)
             acct = self.client.get_account()
