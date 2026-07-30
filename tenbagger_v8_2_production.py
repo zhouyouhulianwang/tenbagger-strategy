@@ -49,6 +49,19 @@ v8.3 FIXES (independent review, branch v8.3-fixes):
   [MEDIUM]   D6: Advertised 21d-high filter was dead code -> wired in
   [MEDIUM]   A4: Live rebalance ignored regime position factor -> applied
 
+v8.4 FIXES (P2: data integrity & de-biasing):
+  [CRITICAL] E1: Static 2024 fundamentals (look-ahead) -> PointInTimeFundamentals:
+             SEC XBRL companyfacts quarterly snapshots, visible only from each
+             period's earliest EDGAR filed date; PE/PB/ROE/GM/growth/PEG/
+             dividend-yield/market-cap recomputed per query date; share counts
+             split-adjusted to match split-adjusted prices
+  [HIGH]     E2: INNOVATION_PREMIUM / SECTOR_PREMIUM hand-tuned stock/sector
+             score boosts removed (survivorship-flavored curve fitting)
+  [MEDIUM]   E3: FINRA TAF was charged on buys too -> sell-side only (like SEC fee)
+  [MEDIUM]   E4: Full-universe mode (--universe full): 520-stock pool with
+             Nasdaq daily histories + per-stock PIT fundamentals; ticker
+             validity verified implicitly by data availability
+
 Usage:
   # Backtest
   python tenbagger_v8_2_production.py --mode backtest --start 2019-01-01 --end 2024-01-01 --plot
@@ -75,6 +88,7 @@ import logging
 import logging.handlers
 import argparse
 import tempfile
+import bisect
 import warnings
 import hashlib
 import getpass
@@ -475,8 +489,8 @@ class TransactionCostModel:
         # SEC fee (sell only)
         sec_fee = 0.0 if is_buy else gross * config.SEC_FEE_RATE
         
-        # FINRA TAF
-        finra_taf = min(qty * config.FINRA_TAF_PER_SHARE, config.FINRA_TAF_MAX)
+        # FINRA TAF (sell only, like the SEC fee)
+        finra_taf = 0.0 if is_buy else min(qty * config.FINRA_TAF_PER_SHARE, config.FINRA_TAF_MAX)
         
         # Slippage
         slippage_bps = cls.get_slippage_bps(market_cap, config)
@@ -827,6 +841,82 @@ class RealtimeFundamentals:
     def get_sector(self, symbol: str) -> str:
         return self.cache.get(symbol, {}).get('sector', 'Unknown')
 
+    def get_asof(self, symbol: str, date=None, price: float = None) -> Dict:
+        """Interface compatibility with PointInTimeFundamentals (live mode:
+        the cache is always 'as of now')."""
+        return self.cache.get(symbol, {})
+
+
+class PointInTimeFundamentals:
+    """Point-in-time fundamentals built from SEC XBRL companyfacts snapshots.
+
+    Each quarterly snapshot becomes visible only on/after its EDGAR 'filed'
+    date (the 'avail' field), which eliminates look-ahead bias. Valuation and
+    quality ratios are computed at query time from TTM flows (revenue, net
+    income, gross profit, dividends), balance-sheet instants (equity) and
+    split-adjusted share counts, valued at the query-day price.
+    """
+
+    def __init__(self, config: Config = None, pit_file: str = None,
+                 sector_map: Dict[str, str] = None):
+        self.config = config or Config()
+        self.snaps: Dict[str, List[Dict]] = {}
+        self._avails: Dict[str, List[str]] = {}
+        embedded_sectors: Dict[str, str] = {}
+        path = Path(pit_file) if pit_file else self.config.DATA_DIR / 'pit_fundamentals.json'
+        if path.exists():
+            try:
+                with open(path) as f:
+                    data = json.load(f)
+                for sym, snaps in data.get('symbols', {}).items():
+                    self.snaps[sym] = sorted(snaps, key=lambda s: s['avail'])
+                    self._avails[sym] = [s['avail'] for s in self.snaps[sym]]
+                embedded_sectors = data.get('sectors', {})
+                logger.info(f"PIT fundamentals loaded: {len(self.snaps)} symbols from {path}")
+            except Exception as e:
+                logger.warning(f"PIT fundamentals load failed: {e}")
+        else:
+            logger.warning(f"PIT fundamentals file not found: {path}")
+        self.sector_map = sector_map if sector_map else embedded_sectors
+
+    def snapshot_asof(self, symbol: str, date) -> Optional[Dict]:
+        """Latest raw snapshot available on `date` (None if nothing filed yet)."""
+        avails = self._avails.get(symbol)
+        if not avails:
+            return None
+        d = str(date)[:10]
+        i = bisect.bisect_right(avails, d) - 1
+        return self.snaps[symbol][i] if i >= 0 else None
+
+    def get_asof(self, symbol: str, date=None, price: float = None) -> Dict:
+        """Strategy-ready ratios as knowable on `date`, valued at `price`."""
+        s = self.snapshot_asof(symbol, date)
+        if s is None:
+            return {}
+        f: Dict[str, Any] = {'sector': self.sector_map.get(symbol, 'Unknown'),
+                             'source': 'sec_xbrl_pit', '_timestamp': s['avail']}
+        shares = s.get('shares') or 0
+        mc = price * shares if (price and shares) else 0
+        ni, rev, eq = s.get('ni_ttm'), s.get('rev_ttm'), s.get('equity')
+        f['market_cap'] = mc
+        f['pe_ratio'] = mc / ni if (mc and ni and ni > 0) else 999
+        f['pb_ratio'] = mc / eq if (mc and eq and eq > 0) else 999
+        f['ps_ratio'] = mc / rev if (mc and rev) else 999
+        f['roe'] = ni / eq if (ni is not None and eq) else 0.0
+        # gm is None when gross profit is not reported (banks etc.) - callers
+        # must treat None as "not applicable", not as 0
+        f['gm'] = s['gp_ttm'] / rev if (s.get('gp_ttm') is not None and rev) else None
+        f['rev_g'] = rev / s['rev_ya'] - 1 if (rev and s.get('rev_ya')) else 0.0
+        pg = ni / s['ni_ya'] - 1 if (ni is not None and s.get('ni_ya')) else None
+        f['profit_g'] = pg if pg is not None else 0.0
+        f['dividend_yield'] = (s.get('div_ttm') or 0) / mc if mc else 0.0
+        f['peg_ratio'] = (f['pe_ratio'] / (pg * 100)
+                          if (pg is not None and pg > 0.02 and f['pe_ratio'] < 999) else 999)
+        return f
+
+    def get_sector(self, symbol: str) -> str:
+        return self.sector_map.get(symbol, 'Unknown')
+
 
 # ============================================================================
 # TECHNICAL INDICATORS
@@ -976,41 +1066,36 @@ class GrowthStrategy:
         self.fundamentals = fundamentals
         self.ind = TechnicalIndicators()
     
-    INNOVATION_PREMIUM = {
-        'NVDA': 0.15, 'AMD': 0.15, 'TSLA': 0.10,
-        'GOOGL': 0.08, 'META': 0.08, 'AMZN': 0.08,
-        'MSFT': 0.05, 'AAPL': 0.05,
-    }
-    
     def score(self, symbol: str, prices: pd.DataFrame, benchmark: pd.Series, t: int) -> Optional[Dict]:
         s = prices[symbol].iloc[:t+1]
-        f = self.fundamentals.cache.get(symbol, {})
         if len(s) < 126:
             return None
-        
-        roe = f.get('roe', 0.10)
-        gm = f.get('gm', 0.20)
+        f = self.fundamentals.get_asof(symbol, prices.index[t], price=s.iloc[-1])
+        if not f:
+            return None  # no filings available yet -> no growth signal
+
+        roe = f.get('roe', 0.0)
+        gm = f.get('gm')  # None when not reported (banks/insurers): filter skipped, neutral score
         mom_21 = self.ind.momentum(s, 21)
         mom_63 = self.ind.momentum(s, 63)
         rs = self.ind.rs_rating(s, benchmark.iloc[:t+1], 126)
         above_50d = self.ind.above_ma(s, 50)
-        
-        if roe < self.config.MIN_ROE or gm < self.config.MIN_GROSS_MARGIN or rs < 50 or not above_50d:
+
+        if roe < self.config.MIN_ROE or (gm is not None and gm < self.config.MIN_GROSS_MARGIN) or rs < 50 or not above_50d:
             return None
-        
+
         roe_s = min(roe / 0.25 * 100, 100)
-        gm_s = min(gm / 0.50 * 100, 100)
-        rev_s = min(max(f.get('rev_g', 0.08) / 0.30 * 100, 0), 100)
-        profit_s = min(max(f.get('profit_g', 0.08) / 0.35 * 100, 0), 100)
+        gm_s = min(gm / 0.50 * 100, 100) if gm is not None else 50.0
+        rev_s = min(max(f.get('rev_g', 0.0) / 0.30 * 100, 0), 100)
+        profit_s = min(max(f.get('profit_g', 0.0) / 0.35 * 100, 0), 100)
         accel_s = min(max((mom_21 - mom_63 / 3 + 0.2) / 0.4 * 100, 0), 100)
-        
+
         quality = (roe_s * 0.30 + gm_s * 0.20 + rev_s * 0.20 + profit_s * 0.20 + accel_s * 0.10) / 100
         momentum_score = mom_63 * 0.5 if mom_63 > 0.05 else 0
-        innovation = self.INNOVATION_PREMIUM.get(symbol, 0.0)
-        
+
         return {
-            'total': quality + momentum_score + innovation,
-            'quality': quality, 'momentum': momentum_score, 'innovation': innovation,
+            'total': quality + momentum_score,
+            'quality': quality, 'momentum': momentum_score,
             'roe': roe, 'gm': gm, 'mom_21': mom_21, 'mom_63': mom_63, 'rs': rs,
         }
     
@@ -1030,29 +1115,24 @@ class ValueStrategy:
         self.fundamentals = fundamentals
         self.ind = TechnicalIndicators()
     
-    SECTOR_PREMIUM = {
-        'Technology': 1.3, 'Financial Services': 0.9, 'Healthcare': 1.2,
-        'Consumer Defensive': 1.0, 'Utilities': 0.8, 'Energy': 0.7,
-        'Communication Services': 1.1, 'Industrials': 1.0,
-        'Consumer Cyclical': 1.0, 'Real Estate': 0.9, 'Materials': 0.9,
-    }
-    
     def score(self, symbol: str, prices: pd.DataFrame, benchmark: pd.Series, t: int) -> Optional[Dict]:
         s = prices[symbol].iloc[:t+1]
-        f = self.fundamentals.cache.get(symbol, {})
         if len(s) < 126:
             return None
-        
+        f = self.fundamentals.get_asof(symbol, prices.index[t], price=s.iloc[-1])
+        if not f:
+            return None  # no filings available yet -> no value signal
+
         pe = f.get('pe_ratio', 999)
         pb = f.get('pb_ratio', 999)
         div = f.get('dividend_yield', 0)
         peg = f.get('peg_ratio', 999)
-        roe = f.get('roe', 0.10)
+        roe = f.get('roe', 0.0)
         sector = f.get('sector', 'Unknown')
         market_cap = f.get('market_cap', 0)
-        
-        adj_max_pe = self.config.VALUE_MAX_PE * self.SECTOR_PREMIUM.get(sector, 1.0)
-        adj_max_pb = self.config.VALUE_MAX_PB * self.SECTOR_PREMIUM.get(sector, 1.0)
+
+        adj_max_pe = self.config.VALUE_MAX_PE
+        adj_max_pb = self.config.VALUE_MAX_PB
         
         if pe > adj_max_pe or pe <= 0 or pb > adj_max_pb or pb <= 0 or peg > 2.5 or roe < 0.08:
             return None
@@ -1097,24 +1177,27 @@ class DefensiveStrategy:
     
     def score(self, symbol: str, prices: pd.DataFrame, benchmark: pd.Series, t: int) -> Optional[Dict]:
         s = prices[symbol].iloc[:t+1]
-        f = self.fundamentals.cache.get(symbol, {})
         if len(s) < 50:
             return None
-        
+        f = self.fundamentals.get_asof(symbol, prices.index[t], price=s.iloc[-1])
+        if not f:
+            return None  # no filings available yet -> no defensive signal
+
         vol = self.ind.volatility(s, 20)
-        roe = f.get('roe', 0.10)
-        gm = f.get('gm', 0.20)
+        roe = f.get('roe', 0.0)
+        gm = f.get('gm')  # None when not reported (banks/insurers)
         div = f.get('dividend_yield', 0)
         sector = f.get('sector', 'Unknown')
         rs = self.ind.rs_rating(s, benchmark.iloc[:t+1], 126)
-        
-        if vol > self.config.DEFENSIVE_MAX_VOLATILITY or roe < 0.10 or gm < 0.25:
+
+        if vol > self.config.DEFENSIVE_MAX_VOLATILITY or roe < 0.10 or (gm is not None and gm < 0.25):
             return None
-        
+
         vol_score = max((self.config.DEFENSIVE_MAX_VOLATILITY - vol) / self.config.DEFENSIVE_MAX_VOLATILITY, 0)
         sector_bonus = 0.20 if sector in self.DEFENSIVE_SECTORS else 0.0
         div_score = min(div / self.config.DEFENSIVE_MIN_DIV_YIELD * 0.5, 1.0) if div > 0 else 0
-        quality = min(roe / 0.20 * 0.5, 0.5) + min(gm / 0.50 * 0.3, 0.3)
+        gm_quality = min(gm / 0.50 * 0.3, 0.3) if gm is not None else 0.15
+        quality = min(roe / 0.20 * 0.5, 0.5) + gm_quality
         rs_score = 0.1 if rs > 40 else 0.0
         ma_slope = (s.rolling(50).mean().iloc[-1] - s.rolling(50).mean().iloc[-10]) / s.rolling(50).mean().iloc[-10] if len(s) >= 60 else 0
         stability = 0.1 if ma_slope > -0.01 else 0.0
@@ -1985,7 +2068,8 @@ class BacktestEngine:
                             reason = 'trailing_50'
                     
                     if stop_triggered:
-                        mkt_cap = fundamentals.cache.get(sym, {}).get('market_cap', 50e9)
+                        _fa = fundamentals.get_asof(sym, current_date, price)
+                        mkt_cap = _fa.get('market_cap', 0) or 50e9
                         net_price = txn.apply_to_backtest(price, shares, is_buy=False, market_cap=mkt_cap, config=self.config)
                         sell_value = shares * net_price
                         cash += sell_value
@@ -2021,7 +2105,8 @@ class BacktestEngine:
                 for sym, shares in list(positions.items()):
                     if shares > 0 and sym in current_prices and current_prices[sym] > 0:
                         price = current_prices[sym]
-                        mkt_cap = fundamentals.cache.get(sym, {}).get('market_cap', 50e9)
+                        _fa = fundamentals.get_asof(sym, current_date, price)
+                        mkt_cap = _fa.get('market_cap', 0) or 50e9
                         net_price = txn.apply_to_backtest(price, shares, is_buy=False,
                                                           market_cap=mkt_cap, config=self.config)
                         cash += shares * net_price
@@ -2148,7 +2233,8 @@ class BacktestEngine:
                 for sym, shares in list(positions.items()):
                     if sym not in targets and shares > 0 and exec_prices.get(sym, 0) > 0:
                         price = exec_prices[sym]
-                        mkt_cap = fundamentals.cache.get(sym, {}).get('market_cap', 50e9)
+                        _fa = fundamentals.get_asof(sym, exec_date, price)
+                        mkt_cap = _fa.get('market_cap', 0) or 50e9
                         net_price = txn.apply_to_backtest(price, shares, is_buy=False,
                                                           market_cap=mkt_cap, config=self.config)
                         cash += shares * net_price
@@ -2172,7 +2258,8 @@ class BacktestEngine:
                     if cur_shares > 0 and abs(cur_val - target_val) / target_val < 0.25:
                         continue  # close enough - keep as is
                     delta_val = target_val - cur_val
-                    mkt_cap = fundamentals.cache.get(sym, {}).get('market_cap', 50e9)
+                    _fa = fundamentals.get_asof(sym, exec_date, price)
+                    mkt_cap = _fa.get('market_cap', 0) or 50e9
                     if delta_val > 0:
                         add = int(delta_val / price)
                         if add > 0:
@@ -2828,6 +2915,8 @@ def main():
     parser.add_argument('--start', default='2019-01-01')
     parser.add_argument('--end', default='2024-01-01')
     parser.add_argument('--plot', action='store_true')
+    parser.add_argument('--universe', choices=['ten', 'full'], default='ten',
+                        help='ten = 10-stock dev universe; full = Config.UNIVERSE (520 stocks)')
     parser.add_argument('--no-param-optimize', action='store_true',
                         help='Disable parameter optimization in walk-forward')
     args = parser.parse_args()
@@ -2847,13 +2936,25 @@ def main():
     if args.mode == 'backtest' or args.mode == 'walkforward':
         # Load cached data
         data_dir = config.DATA_DIR
-        price_files = {
-            'AAPL': 'aapl.csv', 'MSFT': 'msft.csv', 'NVDA': 'nvda.csv',
-            'AMZN': 'amzn_2021_2023.csv', 'GOOGL': 'googl_2021_2023.csv',
-            'META': 'meta_2021_2023.csv', 'TSLA': 'tsla.csv',
-            'JPM': 'jpm.csv', 'UNH': 'unh.csv', 'SPY': 'spy_2021_2023_v2.csv',
-            'SQQQ': 'sqqq.csv',  # v8.3: hedge ETF price history
-        }
+        if args.universe == 'full':
+            # v8.4: full Config.UNIVERSE pool; per-symbol CSVs in data/universe/
+            price_files = {}
+            uni_dir = os.path.join(data_dir, 'universe')
+            for sym in config.UNIVERSE:
+                fp = os.path.join(uni_dir, f'{sym}.csv')
+                if os.path.exists(fp):
+                    price_files[sym] = os.path.join('universe', f'{sym}.csv')
+            price_files['SPY'] = 'spy_2021_2023_v2.csv'
+            price_files['SQQQ'] = 'sqqq.csv'
+            print(f"Full universe: {len(price_files) - 2} stocks with price data")
+        else:
+            price_files = {
+                'AAPL': 'aapl.csv', 'MSFT': 'msft.csv', 'NVDA': 'nvda.csv',
+                'AMZN': 'amzn_2021_2023.csv', 'GOOGL': 'googl_2021_2023.csv',
+                'META': 'meta_2021_2023.csv', 'TSLA': 'tsla.csv',
+                'JPM': 'jpm.csv', 'UNH': 'unh.csv', 'SPY': 'spy_2021_2023_v2.csv',
+                'SQQQ': 'sqqq.csv',  # v8.3: hedge ETF price history
+            }
 
         all_data = {}
         for sym, fname in price_files.items():
@@ -2867,7 +2968,17 @@ def main():
                 elif len(df.columns) > 0:
                     all_data[sym] = df.iloc[:, 0]
 
-        prices = pd.DataFrame(all_data).ffill().dropna()
+        prices = pd.DataFrame(all_data)
+        if args.universe == 'full':
+            # stocks that start trading later than SPY (spinoffs/IPOs) would
+            # truncate the whole frame in dropna(); drop the columns instead
+            first_spy = prices['SPY'].first_valid_index()
+            late = [c for c in prices.columns
+                    if c not in ('SPY', 'SQQQ') and prices[c].first_valid_index() > first_spy]
+            if late:
+                print(f"Excluding {len(late)} late-start stocks: {sorted(late)}")
+                prices = prices.drop(columns=late)
+        prices = prices.ffill().dropna()
         benchmark = prices['SPY']
 
         # v8.3: real VIX history (CBOE format: DATE,OPEN,HIGH,LOW,CLOSE)
@@ -2884,28 +2995,28 @@ def main():
         else:
             print("WARNING: data/vix.csv not found - hedge disabled in backtest")
         
-        # Fundamentals
-        fundamentals = RealtimeFundamentals(config)
-        fund_data = {
-            'AAPL': {'roe':0.28,'gm':0.45,'rev_g':0.08,'profit_g':0.05,'pe_ratio':28,'pb_ratio':2.5,'dividend_yield':0.005,'market_cap':3000e9,'sector':'Technology'},
-            'MSFT': {'roe':0.25,'gm':0.68,'rev_g':0.11,'profit_g':0.12,'pe_ratio':32,'pb_ratio':3.0,'dividend_yield':0.007,'market_cap':2500e9,'sector':'Technology'},
-            'NVDA': {'roe':0.35,'gm':0.72,'rev_g':0.85,'profit_g':1.20,'pe_ratio':65,'pb_ratio':8.0,'dividend_yield':0.003,'market_cap':1000e9,'sector':'Technology'},
-            'AMZN': {'roe':0.12,'gm':0.47,'rev_g':0.13,'profit_g':0.20,'pe_ratio':105,'pb_ratio':3.5,'dividend_yield':0,'market_cap':1300e9,'sector':'Consumer Cyclical'},
-            'GOOGL': {'roe':0.22,'gm':0.56,'rev_g':0.10,'profit_g':0.08,'pe_ratio':25,'pb_ratio':2.2,'dividend_yield':0,'market_cap':1700e9,'sector':'Communication Services'},
-            'META': {'roe':0.18,'gm':0.78,'rev_g':0.15,'profit_g':0.35,'pe_ratio':35,'pb_ratio':2.8,'dividend_yield':0,'market_cap':800e9,'sector':'Communication Services'},
-            'TSLA': {'roe':0.15,'gm':0.19,'rev_g':0.35,'profit_g':0.50,'pe_ratio':70,'pb_ratio':4.0,'dividend_yield':0,'market_cap':800e9,'sector':'Consumer Cyclical'},
-            'JPM': {'roe':0.12,'gm':0.85,'rev_g':0.18,'profit_g':0.15,'pe_ratio':10,'pb_ratio':1.2,'dividend_yield':0.025,'market_cap':400e9,'sector':'Financial Services'},
-            'UNH': {'roe':0.18,'gm':0.72,'rev_g':0.12,'profit_g':0.10,'pe_ratio':22,'pb_ratio':2.0,'dividend_yield':0.013,'market_cap':450e9,'sector':'Healthcare'},
+        # Fundamentals: point-in-time SEC XBRL snapshots (no look-ahead).
+        # Sectors are stable classifications, kept as a static map; all
+        # valuation/quality ratios are computed per query date from filings.
+        sector_map = {
+            'AAPL': 'Technology', 'MSFT': 'Technology', 'NVDA': 'Technology',
+            'AMZN': 'Consumer Cyclical', 'GOOGL': 'Communication Services',
+            'META': 'Communication Services', 'TSLA': 'Consumer Cyclical',
+            'JPM': 'Financial Services', 'UNH': 'Healthcare',
         }
-        for sym, d in fund_data.items():
-            d['_timestamp'] = '2024-01-01'
-            fundamentals.cache[sym] = d
+        if args.universe == 'full':
+            fundamentals = PointInTimeFundamentals(
+                config, pit_file=os.path.join(config.DATA_DIR, 'pit_fundamentals_full.json'))
+        else:
+            fundamentals = PointInTimeFundamentals(config, sector_map=sector_map)
+        if not fundamentals.snaps:
+            print("WARNING: pit_fundamentals.json missing/empty - strategies will select nothing")
         
         if args.mode == 'backtest':
             print("=" * 70)
-            print("TENBAGGER v8.2 BACKTEST")
+            print("TENBAGGER v8.4 BACKTEST")
             print(f"Period: {prices.index[0]} ~ {prices.index[-1]}")
-            print("Features: Transaction costs (ALL fees) | Next-day execution | 5 strategies")
+            print("Features: PIT fundamentals (SEC XBRL) | Transaction costs | Next-day execution")
             print("FIXES: BUG-001,002,003,004 | HP-001..010 | MP-001..006")
             print("=" * 70)
             
