@@ -26,6 +26,29 @@ ALL CRITICAL & HIGH DEFECTS FIXED (v8.1 -> v8.2):
   [MEDIUM]   MP-005: Loop end n_days-1 -> n_days (include last day)
   [MEDIUM]   MP-006: Configurable data feed (iex/sip)
 
+v8.3 FIXES (independent review, branch v8.3-fixes):
+  [CRITICAL] A1: Live rebalance fetched only 60d of bars -> momentum/growth/value
+             strategies silently disabled; now fetches 400d
+  [CRITICAL] B1: "VIX = VIXY x 0.85" proxy removed -> VixProvider (yfinance ^VIX
+             quote, CBOE official EOD fallback, stale-data guard)
+  [CRITICAL] A2: Backtest liquidated the whole portfolio every week -> delta-based
+             rebalancing that keeps overlapping holdings (trailing stops reachable)
+  [CRITICAL] A3: Backtest had no RiskController/HedgeEngine -> both wired in;
+             hedge trades SQQQ on real VIX with the same hysteresis rules as live
+  [HIGH]     C1: Daily-loss baseline updated every call (became a 60s loss limit)
+             -> frozen at yesterday's last equity
+  [HIGH]     C2: Stops/hedge ran 24/7 on stale data -> market-hours gating +
+             TRADING_ENABLED shadow mode
+  [HIGH]     D1: Transaction cost summary let buy/sell costs cancel (~15x
+             underestimate) -> costs summed per side
+  [HIGH]     D3: SPY was a selectable candidate (18% of backtest buys) -> excluded
+  [HIGH]     D2: WFA test window (126d) < engine warmup (252d) -> warmup prepended
+  [MEDIUM]   B3: Hedge state flipped before order execution -> committed on success
+  [MEDIUM]   C3: Weekly rebalance sold the SQQQ hedge and stops applied to it ->
+             hedge ETF excluded from stock stop/rebalance logic
+  [MEDIUM]   D6: Advertised 21d-high filter was dead code -> wired in
+  [MEDIUM]   A4: Live rebalance ignored regime position factor -> applied
+
 Usage:
   # Backtest
   python tenbagger_v8_2_production.py --mode backtest --start 2019-01-01 --end 2024-01-01 --plot
@@ -51,6 +74,7 @@ import time
 import logging
 import logging.handlers
 import argparse
+import tempfile
 import warnings
 import hashlib
 import getpass
@@ -77,11 +101,12 @@ warnings.filterwarnings('ignore')
 LOG_DIR = Path(__file__).parent / 'logs'
 try:
     LOG_DIR.mkdir(exist_ok=True)
-    # MP-004 FIX: Check directory is writable
+    # MP-004 FIX (v8.3): fall back to a writable temp dir instead of just warning
     if not os.access(LOG_DIR, os.W_OK):
-        print(f"WARNING: Log directory {LOG_DIR} is not writable", file=sys.stderr)
+        raise PermissionError(f"{LOG_DIR} is not writable")
 except OSError as e:
-    print(f"WARNING: Cannot create log directory: {e}", file=sys.stderr)
+    print(f"WARNING: Cannot use log directory {LOG_DIR}: {e}. Falling back to temp dir.",
+          file=sys.stderr)
     LOG_DIR = Path(tempfile.gettempdir()) / 'tenbagger_logs'
     LOG_DIR.mkdir(exist_ok=True)
 
@@ -232,8 +257,15 @@ class Config:
     # === Data ===
     DATA_DIR: Path = field(default_factory=lambda: Path(__file__).parent / 'data')
     CACHE_TTL_DAYS: int = 7
-    MIN_DATA_DAYS: int = 30
+    # v8.3: strategies need up to 252 trading days (momentum), so live rebalances
+    # must fetch enough history; 30 days silently disabled 3 of 4 strategies.
+    MIN_DATA_DAYS: int = 252
     MIN_STOCKS_FOR_REBALANCE: int = 10
+
+    # === VIX data (v8.3: real VIX instead of VIXY x 0.85 proxy) ===
+    VIX_CBOE_URL: str = "https://cdn.cboe.com/api/global/us_indices/daily_prices/VIX_History.csv"
+    VIX_CACHE_TTL_SEC: int = 60
+    VIX_MAX_STALE_DAYS: int = 5        # EOD fallback older than this -> treat as unavailable
     
     # MP-006 FIX: Configurable data feed
     DATA_FEED: str = "iex"  # "iex" for free, "sip" for live (subscription required)
@@ -1246,7 +1278,8 @@ class RiskController:
         self._circuit_time = None
         self._peak_equity = 0
         # BUG-001 FIX: Initialize as None instead of 0 to avoid division-by-zero
-        self._last_equity = None
+        self._last_equity = None       # last equity seen (any call)
+        self._day_baseline = None      # v8.3: frozen at yesterday's last equity
         self._last_date = None
     
     # --- Concurrency ---
@@ -1264,16 +1297,23 @@ class RiskController:
         return self._rebalancing
     
     # --- Daily Loss & Drawdown ---
-    def check_limits(self, equity: float) -> Tuple[bool, str]:
-        """Returns (can_trade, reason)."""
-        now = datetime.now()
-        
-        # BUG-001 FIX: Reset daily on new day - set to current equity, not 0
-        if self._last_date and now.date() != self._last_date:
-            self._last_equity = equity  # Was: 0 (caused division by zero!)
-            logger.debug(f"New day - daily equity baseline reset to ${equity:,.2f}")
-        self._last_date = now.date()
-        
+    def check_limits(self, equity: float, now: datetime = None) -> Tuple[bool, str]:
+        """Returns (can_trade, reason).
+
+        v8.3 (C1 fix): the daily baseline is the LAST equity of the previous day
+        and is never updated intraday. The v8.2 version updated `_last_equity`
+        on every call, which turned the "-3% per day" limit into a
+        "-3% per monitoring-interval" limit: slow intraday bleed never triggered
+        it and overnight gaps were ignored.
+        """
+        now = now or datetime.now()
+
+        # New day: freeze the baseline at yesterday's last seen equity.
+        if self._last_date != now.date():
+            self._day_baseline = self._last_equity if self._last_equity is not None else equity
+            self._last_date = now.date()
+            logger.debug(f"New day - daily equity baseline = ${self._day_baseline:,.2f}")
+
         # Circuit breaker check
         if self._circuit_active and self._circuit_time:
             elapsed = (now - self._circuit_time).total_seconds() / 3600
@@ -1282,19 +1322,20 @@ class RiskController:
                 self._circuit_active = False
                 self._circuit_time = None
             else:
-                return False, f"circuit_breaker ({elapsed:.0f}h remaining)"
-        
+                return False, f"circuit_breaker ({self.config.CIRCUIT_BREAKER_COOLDOWN_HOURS - elapsed:.0f}h remaining)"
+
         # Update peak
         if equity > self._peak_equity:
             self._peak_equity = equity
-        
-        # Daily loss limit (BUG-001: now safe because _last_equity is None or valid)
-        if self._last_equity is not None and self._last_equity > 0:
-            daily_pnl = (equity - self._last_equity) / self._last_equity
+
+        # Daily loss limit vs day baseline (BUG-001: None-safe)
+        if self._day_baseline is not None and self._day_baseline > 0:
+            daily_pnl = (equity - self._day_baseline) / self._day_baseline
             if daily_pnl <= self.config.DAILY_LOSS_LIMIT_PCT:
                 logger.critical(f"DAILY LOSS LIMIT: {daily_pnl:.2%} (threshold: {self.config.DAILY_LOSS_LIMIT_PCT:.2%})")
+                self._last_equity = equity
                 return False, f"daily_loss_limit ({daily_pnl:.2%})"
-        
+
         # Max drawdown
         if self._peak_equity > 0:
             dd = (equity - self._peak_equity) / self._peak_equity
@@ -1302,8 +1343,14 @@ class RiskController:
                 logger.critical(f"MAX DRAWDOWN: {dd:.2%} (threshold: {self.config.MAX_DRAWDOWN_LIMIT_PCT:.2%})")
                 self._circuit_active = True
                 self._circuit_time = now
+                # v8.3: reset the peak after a breach. Otherwise, once
+                # liquidated to cash, equity can never recover toward the old
+                # peak and the breaker re-triggers every cycle forever
+                # (permanent lockout, observed flapping every 24h).
+                self._peak_equity = equity
+                self._last_equity = equity
                 return False, f"max_drawdown ({dd:.2%})"
-        
+
         self._last_equity = equity
         return True, "OK"
     
@@ -1467,19 +1514,85 @@ class PortfolioConstructor:
 
 
 # ============================================================================
+# VIX DATA PROVIDER (v8.3)
+# Replaces the broken "VIX = VIXY price x 0.85" proxy: VIXY is a futures ETF
+# whose price level is driven by contango decay and reverse splits, so it has
+# no stable mapping to the VIX index. Real sources, in priority order:
+#   1. yfinance ^VIX quote (near real-time)
+#   2. CBOE official VIX history CSV (end-of-day, staleness-guarded)
+# Returns None when no fresh source is available -> caller must HOLD.
+# ============================================================================
+
+class VixProvider:
+    """Real VIX level with TTL caching and stale-data guards."""
+
+    def __init__(self, config: Config = None):
+        self.config = config or Config()
+        self._cached: Optional[float] = None
+        self._cached_at: float = 0.0
+
+    def get_vix(self) -> Optional[float]:
+        now = time.time()
+        if self._cached is not None and now - self._cached_at < self.config.VIX_CACHE_TTL_SEC:
+            return self._cached
+        vix = self._from_yfinance()
+        if vix is None:
+            vix = self._from_cboe_eod()
+        if vix is not None:
+            self._cached, self._cached_at = vix, now
+        return vix
+
+    def _from_yfinance(self) -> Optional[float]:
+        try:
+            import yfinance as yf
+            t = yf.Ticker('^VIX')
+            price = getattr(t.fast_info, 'last_price', None)
+            if price and 5.0 < float(price) < 150.0:
+                return float(price)
+        except Exception as e:
+            logger.debug(f"VIX yfinance unavailable: {e}")
+        return None
+
+    def _from_cboe_eod(self) -> Optional[float]:
+        """CBOE official daily VIX history (EOD only; rejected if stale)."""
+        try:
+            r = requests.get(self.config.VIX_CBOE_URL, timeout=self.config.API_TIMEOUT)
+            if r.status_code != 200:
+                return None
+            import io
+            df = pd.read_csv(io.StringIO(r.text))
+            df.columns = [c.strip().upper() for c in df.columns]
+            df['DATE'] = pd.to_datetime(df['DATE'], format='%m/%d/%Y')
+            last = df.iloc[-1]
+            age_days = (datetime.now() - last['DATE']).days
+            if age_days > self.config.VIX_MAX_STALE_DAYS:
+                logger.warning(f"VIX EOD data stale ({age_days}d old), rejecting")
+                return None
+            if age_days >= 1:
+                logger.info(f"VIX from CBOE EOD ({last['DATE'].date()}), not intraday")
+            return float(last['CLOSE'])
+        except Exception as e:
+            logger.debug(f"VIX CBOE unavailable: {e}")
+        return None
+
+
+# ============================================================================
 # HEDGE ENGINE — Multi-Layer Portfolio Protection
 # DCL: get_prices(刷新) → calculate_hedge(信号) → submit_order(下单)
 # ============================================================================
 
 class HedgeEngine:
     """
-    Real-Time Conditional Hedge: SQQQ 10% when VIX>=25, zero when VIX<=23.5.
-    Hysteresis band [23.5, 25] prevents jitter. Daily switch limit=2 (circuit breaker).
-    Research: Permanent hedge costs 9%/yr; conditional hedge Sharpe 2.56, DD -23.2%.
+    Real-Time Conditional Hedge: SQQQ 10% when VIX>=25, zero when VIX<=24.75.
+    Hysteresis band (24.75, 25) prevents jitter. Daily switch limit=2 (circuit breaker).
+    v8.3: state is committed ONLY after a successful order (was: flipped before
+    execution, causing state/position desync on order failure).
     """
     
-    def __init__(self, config: Config = None, client: AlpacaClient = None):
+    def __init__(self, config: Config = None, client: AlpacaClient = None,
+                 vix_provider: 'VixProvider' = None):
         self.config = config or Config()
+        self.vix_provider = vix_provider or VixProvider(self.config)
         self._switches_today = 0         # Daily switch counter
         self._last_switch_date = None    # Track date for daily reset
         self._circuit_broken = False     # Daily circuit breaker flag
@@ -1500,30 +1613,27 @@ class HedgeEngine:
             pass
         return False
     
-    def _get_vix_level(self, client: AlpacaClient) -> float:
-        """
-        Get VIX proxy from VIXY price.
-        VIXY is a VIX futures ETF; VIX ≈ VIXY_price × 0.85 (empirical mapping).
-        VIXY=$21 → VIX≈18; VIXY=$29 → VIX≈25 (hedge activate threshold).
-        """
-        try:
-            vixy = client.get_bars('VIXY', days=3)
-            if len(vixy) > 0:
-                vixy_price = float(vixy.iloc[-1])
-                return vixy_price * 0.85  # Empirical: VIX ≈ 0.85 × VIXY
-        except Exception:
-            pass
-        return 20.0  # Neutral default
+    def _get_vix_level(self, client: AlpacaClient = None) -> Optional[float]:
+        """v8.3: real VIX via VixProvider. None = unavailable -> HOLD (no guessing)."""
+        vix = self.vix_provider.get_vix()
+        if vix is None:
+            logger.warning("VIX unavailable from all sources - hedge holds current state")
+        return vix
     
-    def _reset_daily_counter(self):
-        """Reset daily switch counter at new day."""
-        today = datetime.now().date()
+    def _reset_daily_counter(self, now: datetime = None):
+        """Reset daily switch counter at new day.
+
+        v8.3: accepts simulated time. v8.2 used wall-clock datetime.now(), so in
+        backtests the whole run counted as ONE day - after 2 switches the hedge
+        circuit-broke forever (only 2 hedge trades in 4 years).
+        """
+        today = (now or datetime.now()).date()
         if self._last_switch_date != today:
             self._switches_today = 0
             self._circuit_broken = False
             self._last_switch_date = today
     
-    def evaluate(self, vix_level: float) -> str:
+    def evaluate(self, vix_level: float, now: datetime = None) -> str:
         """
         Narrow hysteresis hedge evaluation with daily circuit breaker.
         
@@ -1534,38 +1644,40 @@ class HedgeEngine:
           switches >= 2    → CIRCUIT_BROKEN (no more switches today)
         
         Returns: 'activate' | 'deactivate' | 'hold' | 'circuit_broken'
+
+        v8.3: this method is now PURE (no state mutation). State is committed
+        by _commit_switch() only after the order executes successfully.
         """
         if not self.config.ENABLE_HEDGE:
             return 'hold'
-        
-        self._reset_daily_counter()
-        
+
+        self._reset_daily_counter(now)
+
         # Circuit breaker: max 2 switches per day
         if self._circuit_broken:
             return 'circuit_broken'
-        
+
         # Hysteresis logic
-        if vix_level >= self.config.HEDGE_VIX_ACTIVATE:
-            if not self._hedge_active:
-                if self._switches_today >= self.config.HEDGE_MAX_SWITCHES_PER_DAY:
-                    self._circuit_broken = True
-                    logger.warning(f"HEDGE CIRCUIT BROKEN: {self._switches_today} switches today")
-                    return 'circuit_broken'
-                self._switches_today += 1
-                self._hedge_active = True
-                return 'activate'
-        elif vix_level <= self.config.HEDGE_VIX_DEACTIVATE:
-            if self._hedge_active:
-                if self._switches_today >= self.config.HEDGE_MAX_SWITCHES_PER_DAY:
-                    self._circuit_broken = True
-                    logger.warning(f"HEDGE CIRCUIT BROKEN: {self._switches_today} switches today")
-                    return 'circuit_broken'
-                self._switches_today += 1
-                self._hedge_active = False
-                return 'deactivate'
-        
-        # Hysteresis band: 23.5 < VIX < 25 → maintain current state
+        if vix_level >= self.config.HEDGE_VIX_ACTIVATE and not self._hedge_active:
+            if self._switches_today >= self.config.HEDGE_MAX_SWITCHES_PER_DAY:
+                self._circuit_broken = True
+                logger.warning(f"HEDGE CIRCUIT BROKEN: {self._switches_today} switches today")
+                return 'circuit_broken'
+            return 'activate'
+        if vix_level <= self.config.HEDGE_VIX_DEACTIVATE and self._hedge_active:
+            if self._switches_today >= self.config.HEDGE_MAX_SWITCHES_PER_DAY:
+                self._circuit_broken = True
+                logger.warning(f"HEDGE CIRCUIT BROKEN: {self._switches_today} switches today")
+                return 'circuit_broken'
+            return 'deactivate'
+
+        # Hysteresis band: 24.75 < VIX < 25 → maintain current state
         return 'hold'
+
+    def _commit_switch(self, action: str):
+        """v8.3: commit state AFTER a successful hedge order."""
+        self._switches_today += 1
+        self._hedge_active = (action == 'activate')
     
     def is_hedge_active(self) -> bool:
         """Current hedge state."""
@@ -1731,15 +1843,23 @@ class HedgeEngine:
         if not self.config.ENABLE_HEDGE:
             return {'action': 'disabled'}
         
-        # D: Refresh VIX data
+        # D: Refresh VIX data (None = unavailable -> hold)
         vix = self._get_vix_level(client)
-        
-        # S: Evaluate with hysteresis + circuit breaker
+        if vix is None:
+            return {'action': 'hold', 'vix': None, 'hedge_active': self._hedge_active,
+                    'reason': 'vix_unavailable'}
+
+        # S: Evaluate with hysteresis + circuit breaker (pure, no mutation)
         action = self.evaluate(vix)
-        
-        # O: Execute if state change
+
+        # O: Execute if state change; commit state only on success
         if action in ('activate', 'deactivate'):
             result = self.execute(client, equity, action)
+            if result.get('executed'):
+                self._commit_switch(action)
+            else:
+                # State unchanged: will retry next cycle instead of desyncing
+                logger.warning(f"HEDGE {action} not executed - state kept, retry next cycle")
             result['vix'] = vix
             result['switches_today'] = self._switches_today
             return result
@@ -1771,16 +1891,19 @@ class BacktestEngine:
         self._last_t = 0
     
     def run(self, prices: pd.DataFrame, benchmark: pd.Series,
-            fundamentals: RealtimeFundamentals, use_next_day_open: bool = True) -> Dict:
+            fundamentals: RealtimeFundamentals, use_next_day_open: bool = True,
+            vix: pd.Series = None) -> Dict:
         """
         Run backtest.
-        
+
         Args:
-            use_next_day_open: If True, rebalance executes at t+1 open price
+            use_next_day_open: If True, rebalance executes at t+1 price
                               (simulates EOD signal -> next day execution)
+            vix: Optional VIX close series (DatetimeIndex) driving the
+                 conditional hedge. None -> hedge disabled in backtest.
         """
         n_days = len(prices)
-        
+
         # Init strategies
         mom_strat = MomentumStrategy(self.config)
         # sector rotation disabled (user request)
@@ -1788,22 +1911,35 @@ class BacktestEngine:
         value_strat = ValueStrategy(fundamentals, self.config)
         def_strat = DefensiveStrategy(fundamentals, self.config)
         macro = MacroTiming(self.config)
-        risk = RiskController(self.config)
+        risk = RiskController(self.config)              # v8.3: actually enforced
+        hedge = HedgeEngine(self.config, client=None)   # v8.3: conditional hedge
         constructor = PortfolioConstructor(self.config)
         txn = TransactionCostModel
-        
+
+        # v8.3 (D3): benchmark / hedge ETF are NOT selectable candidates
+        sel_cols = [c for c in prices.columns if c not in ('SPY', self.config.HEDGE_ETF)]
+        sel_prices = prices[sel_cols]
+
+        # v8.3: align VIX to the trading calendar
+        vix_aligned = None
+        if vix is not None and self.config.ENABLE_HEDGE:
+            vix_aligned = vix.reindex(prices.index, method='ffill')
+
         cash = self.config.INITIAL_CAPITAL
-        positions = {}  # {sym: shares}
+        positions = {}      # {sym: shares} - stocks only
+        hedge_shares = 0    # SQQQ shares (managed by hedge engine, not stops)
+        hedge_entry = 0.0
         portfolio_values = []
         trades = []
         daily_rets = []
         entry_prices = {}
         max_prices_tracker = {}
-        
+
         # HP-001 FIX: Reset _last_t at start of each backtest
         self._last_t = 0
-        
-        logger.info(f"Backtest: {n_days} days, next_day_open={use_next_day_open}")
+
+        logger.info(f"Backtest: {n_days} days, next_day_open={use_next_day_open}, "
+                    f"hedge={'on' if vix_aligned is not None else 'off'}")
         
         # MP-005 FIX: Include the last day (was n_days - 1, now n_days)
         loop_end = n_days if not use_next_day_open else n_days
@@ -1865,36 +2001,111 @@ class BacktestEngine:
                 entry_prices.pop(sym, None)
                 max_prices_tracker.pop(sym, None)
             
-            # 2. Portfolio value
+            # 2. Portfolio value (stocks + hedge ETF)
             pos_value = sum(positions[s] * current_prices[s] for s in positions
                            if s in current_prices and current_prices[s] > 0)
-            total_value = cash + pos_value
+            hedge_value = 0.0
+            hedge_px = current_prices.get(self.config.HEDGE_ETF, 0)
+            if hedge_shares > 0 and hedge_px > 0:
+                hedge_value = hedge_shares * hedge_px
+            total_value = cash + pos_value + hedge_value
             portfolio_values.append(total_value)
-            
+
             if len(portfolio_values) > 1:
                 daily_rets.append((portfolio_values[-1] / portfolio_values[-2]) - 1)
-            
-            # 3. Rebalance check
+
+            # 2.5 v8.3: portfolio-level risk limits (daily loss / drawdown breaker).
+            # On breach: liquidate everything at today's close, stop trading today.
+            can_trade, limit_reason = risk.check_limits(total_value, now=current_date)
+            if not can_trade:
+                for sym, shares in list(positions.items()):
+                    if shares > 0 and sym in current_prices and current_prices[sym] > 0:
+                        price = current_prices[sym]
+                        mkt_cap = fundamentals.cache.get(sym, {}).get('market_cap', 50e9)
+                        net_price = txn.apply_to_backtest(price, shares, is_buy=False,
+                                                          market_cap=mkt_cap, config=self.config)
+                        cash += shares * net_price
+                        entry = entry_prices.get(sym, net_price)
+                        trades.append({'date': current_date, 'symbol': sym, 'action': 'SELL',
+                                       'reason': 'risk_' + limit_reason.split(' ')[0],
+                                       'shares': shares, 'price': price, 'net_price': net_price,
+                                       'pnl_pct': (net_price - entry) / entry if entry > 0 else 0})
+                        positions.pop(sym); entry_prices.pop(sym, None)
+                        max_prices_tracker.pop(sym, None)
+                if hedge_shares > 0 and hedge_px > 0:
+                    net_price = txn.apply_to_backtest(hedge_px, hedge_shares, is_buy=False,
+                                                      config=self.config)
+                    cash += hedge_shares * net_price
+                    trades.append({'date': current_date, 'symbol': self.config.HEDGE_ETF,
+                                   'action': 'SELL', 'reason': 'risk_' + limit_reason.split(' ')[0],
+                                   'shares': hedge_shares, 'price': hedge_px, 'net_price': net_price,
+                                   'pnl_pct': (net_price - hedge_entry) / hedge_entry if hedge_entry > 0 else 0})
+                    hedge_shares = 0
+                    hedge._hedge_active = False
+                portfolio_values[-1] = cash
+                if daily_rets:
+                    daily_rets[-1] = portfolio_values[-1] / portfolio_values[-2] - 1
+                continue
+
+            # 2.6 v8.3: conditional hedge (same hysteresis rules as live)
+            if vix_aligned is not None:
+                v = vix_aligned.iloc[t]
+                if not np.isnan(v) and hedge_px > 0:
+                    h_action = hedge.evaluate(float(v), now=current_date)
+                    if h_action == 'activate':
+                        shares = int(total_value * self.config.HEDGE_POSITION_PCT / hedge_px)
+                        if shares > 0:
+                            net_price = txn.apply_to_backtest(hedge_px, shares, is_buy=True,
+                                                              config=self.config)
+                            cost = shares * net_price
+                            if cost <= cash and cash - cost >= 0.01:
+                                cash -= cost
+                                hedge_shares += shares
+                                hedge_entry = net_price
+                                hedge._commit_switch('activate')
+                                trades.append({'date': current_date, 'symbol': self.config.HEDGE_ETF,
+                                               'action': 'BUY', 'reason': f'hedge_activate_vix{v:.1f}',
+                                               'shares': shares, 'price': hedge_px, 'net_price': net_price})
+                    elif h_action == 'deactivate' and hedge_shares > 0:
+                        net_price = txn.apply_to_backtest(hedge_px, hedge_shares, is_buy=False,
+                                                          config=self.config)
+                        cash += hedge_shares * net_price
+                        trades.append({'date': current_date, 'symbol': self.config.HEDGE_ETF,
+                                       'action': 'SELL', 'reason': f'hedge_deactivate_vix{v:.1f}',
+                                       'shares': hedge_shares, 'price': hedge_px, 'net_price': net_price,
+                                       'pnl_pct': (net_price - hedge_entry) / hedge_entry if hedge_entry > 0 else 0})
+                        hedge_shares = 0
+                        hedge._commit_switch('deactivate')
+
+
+            # 3. Rebalance check (v8.3: delta-based - keeps overlapping holdings,
+            #    only trades the difference. v8.2 liquidated everything weekly,
+            #    which made trailing stops unreachable and churned ~33x/yr.)
             days_since = t - self._last_t  # HP-001 FIX: use instance variable
             if days_since >= self.config.REBALANCE_DAYS:
                 self._last_t = t
-                
+
                 # Market regime
                 regime, macro_signal = macro.detect(prices, t)
                 weights = macro.get_weights(regime, self.config)
                 pos_factor = macro_signal.get('position_factor', 1.0)
-                
-                # 5 strategies select
-                mom_picks = mom_strat.select(prices, benchmark, t)
+
+                # 4 strategies select (v8.3: SPY/SQQQ excluded from candidates)
+                mom_picks = mom_strat.select(sel_prices, benchmark, t)
                 # sector rotation disabled
-                growth_picks = growth_strat.select(prices, benchmark, t)
-                value_picks = value_strat.select(prices, benchmark, t)
-                def_picks = def_strat.select(prices, benchmark, t)
-                
+                growth_picks = growth_strat.select(sel_prices, benchmark, t)
+                value_picks = value_strat.select(sel_prices, benchmark, t)
+                def_picks = def_strat.select(sel_prices, benchmark, t)
+
                 # Combine (4 strategies, sector={})
                 combined = constructor.combine(mom_picks, {}, growth_picks,
                                                value_picks, def_picks, weights)
-                
+
+                # v8.3: wire the advertised 21d-high filter (was dead code)
+                combined = constructor.filter_21d_high(combined, prices, t)
+                # 全局波动率过滤: 所有策略信号统一检查20日波动率
+                combined = constructor.filter_by_volatility(combined, prices, t)
+
                 # Determine execution price
                 if use_next_day_open and t + 1 < n_days:
                     exec_prices = prices.iloc[t + 1]  # Next day open (we use close as proxy)
@@ -1902,67 +2113,100 @@ class BacktestEngine:
                 else:
                     exec_prices = current_prices
                     exec_date = current_date
-                
-                # Sell all existing
-                for sym, shares in list(positions.items()):
-                    if sym in exec_prices and exec_prices[sym] > 0 and shares > 0:
-                        mkt_cap = fundamentals.cache.get(sym, {}).get('market_cap', 50e9)
-                        net_price = txn.apply_to_backtest(exec_prices[sym], shares, is_buy=False, market_cap=mkt_cap, config=self.config)
-                        cash += shares * net_price
-                        entry = entry_prices.get(sym, net_price)
-                        pnl = (net_price - entry) / entry if entry > 0 else 0
-                        trades.append({
-                            'date': exec_date, 'symbol': sym, 'action': 'SELL',
-                            'reason': 'rebalance', 'shares': shares, 'price': exec_prices[sym],
-                            'net_price': net_price, 'pnl_pct': pnl,
-                        })
-                
-                positions = {}
-                entry_prices = {}
-                max_prices_tracker = {}
-                
-                # 全局波动率过滤: 所有策略信号统一检查20日波动率
-                combined = constructor.filter_by_volatility(combined, prices, t)
-                
-                # Buy new positions
-                adjusted_capital = total_value * pos_factor
+
+                # Target values: score/vol sized, capped, normalized so total
+                # invested <= adjusted_capital (v8.3: pos_factor is now binding;
+                # hedge compression applies too)
+                adjusted_capital = (total_value * pos_factor
+                                    * hedge.get_stock_compression())
                 top_signals = dict(list(combined.items())[:self.config.MAX_POSITIONS])
-                
+
+                raw_w = {}
                 for sym, signal in top_signals.items():
                     if sym not in exec_prices or exec_prices[sym] <= 0:
                         continue
-                    price = exec_prices[sym]
-                    
                     if t >= 20:
                         vol = prices[sym].iloc[max(0, t-20):t+1].pct_change().std() * np.sqrt(252)
                     else:
                         vol = 0.30
-                    
-                    score_weight = min(signal['total'] / 0.5, 1.0) if signal['total'] > 0 else 0.5
+                    if 'defensive' in signal.get('strategies', []):
+                        vol *= 0.8
                     vol_factor = min(self.config.VOLATILITY_TARGET / vol, 2.0) if vol > 0 else 1.0
-                    target_value = adjusted_capital * vol_factor * score_weight / self.config.MAX_POSITIONS
-                    max_val = adjusted_capital * self.config.MAX_SINGLE_POSITION_PCT
-                    min_val = adjusted_capital * self.config.MIN_SINGLE_POSITION_PCT
-                    target_value = max(min(target_value, max_val), min_val)
-                    
-                    shares = int(target_value / price)
-                    if shares > 0:
+                    score_weight = min(signal['total'] / 0.5, 1.0) if signal['total'] > 0 else 0.5
+                    raw_w[sym] = vol_factor * score_weight
+
+                wsum = sum(raw_w.values())
+                targets = {}
+                if wsum > 0:
+                    for sym, w in raw_w.items():
+                        tv = adjusted_capital * w / wsum
+                        tv = min(tv, adjusted_capital * self.config.MAX_SINGLE_POSITION_PCT)
+                        if tv >= adjusted_capital * self.config.MIN_SINGLE_POSITION_PCT:
+                            targets[sym] = tv
+
+                # Sell positions that fell out of the target set
+                for sym, shares in list(positions.items()):
+                    if sym not in targets and shares > 0 and exec_prices.get(sym, 0) > 0:
+                        price = exec_prices[sym]
                         mkt_cap = fundamentals.cache.get(sym, {}).get('market_cap', 50e9)
-                        net_price = txn.apply_to_backtest(price, shares, is_buy=True, market_cap=mkt_cap, config=self.config)
-                        cost = shares * net_price
-                        # MP-002 FIX: Prevent negative cash with epsilon buffer
-                        if cost <= cash and cash - cost >= 0.01:
-                            cash -= cost
-                            positions[sym] = shares
-                            # BUG-004 FIX: Record entry at net_price (actual cost), not signal price
-                            entry_prices[sym] = net_price  # Was: price (wrong!)
-                            trades.append({
-                                'date': exec_date, 'symbol': sym, 'action': 'BUY',
-                                'reason': f'regime:{regime}', 'shares': shares,
-                                'price': price, 'net_price': net_price,
-                            })
-                        else:
-                            logger.debug(f"Skip {sym}: cost ${cost:.2f} > cash ${cash:.2f}")
+                        net_price = txn.apply_to_backtest(price, shares, is_buy=False,
+                                                          market_cap=mkt_cap, config=self.config)
+                        cash += shares * net_price
+                        entry = entry_prices.get(sym, net_price)
+                        pnl = (net_price - entry) / entry if entry > 0 else 0
+                        trades.append({'date': exec_date, 'symbol': sym, 'action': 'SELL',
+                                       'reason': 'rebalance', 'shares': shares, 'price': price,
+                                       'net_price': net_price, 'pnl_pct': pnl})
+                        positions.pop(sym)
+                        entry_prices.pop(sym, None)
+                        max_prices_tracker.pop(sym, None)
+
+                # Adjust kept/new positions toward targets (trade only the delta;
+                # drift < 25% of target is ignored to avoid churn)
+                for sym, target_val in targets.items():
+                    price = exec_prices.get(sym, 0)
+                    if price <= 0:
+                        continue
+                    cur_shares = positions.get(sym, 0)
+                    cur_val = cur_shares * price
+                    if cur_shares > 0 and abs(cur_val - target_val) / target_val < 0.25:
+                        continue  # close enough - keep as is
+                    delta_val = target_val - cur_val
+                    mkt_cap = fundamentals.cache.get(sym, {}).get('market_cap', 50e9)
+                    if delta_val > 0:
+                        add = int(delta_val / price)
+                        if add > 0:
+                            net_price = txn.apply_to_backtest(price, add, is_buy=True,
+                                                              market_cap=mkt_cap, config=self.config)
+                            cost = add * net_price
+                            # MP-002 FIX: Prevent negative cash with epsilon buffer
+                            if cost <= cash and cash - cost >= 0.01:
+                                cash -= cost
+                                if cur_shares > 0:
+                                    old_entry = entry_prices.get(sym, net_price)
+                                    entry_prices[sym] = ((old_entry * cur_shares + net_price * add)
+                                                         / (cur_shares + add))
+                                else:
+                                    # BUG-004 FIX: Record entry at net_price
+                                    entry_prices[sym] = net_price
+                                positions[sym] = cur_shares + add
+                                trades.append({'date': exec_date, 'symbol': sym, 'action': 'BUY',
+                                               'reason': f'regime:{regime}', 'shares': add,
+                                               'price': price, 'net_price': net_price})
+                            else:
+                                logger.debug(f"Skip {sym}: cost ${cost:.2f} > cash ${cash:.2f}")
+                    elif delta_val < 0 and cur_shares > 0:
+                        reduce = min(int(-delta_val / price), cur_shares)
+                        if reduce > 0:
+                            net_price = txn.apply_to_backtest(price, reduce, is_buy=False,
+                                                              market_cap=mkt_cap, config=self.config)
+                            cash += reduce * net_price
+                            entry = entry_prices.get(sym, net_price)
+                            pnl = (net_price - entry) / entry if entry > 0 else 0
+                            trades.append({'date': exec_date, 'symbol': sym, 'action': 'SELL',
+                                           'reason': 'rebalance_trim', 'shares': reduce,
+                                           'price': price, 'net_price': net_price, 'pnl_pct': pnl})
+                            positions[sym] = cur_shares - reduce
         
         self.results = self._calc_performance(portfolio_values, daily_rets, benchmark, trades, prices)
         return self.results
@@ -2020,9 +2264,14 @@ class BacktestEngine:
         losses = [t for t in sells if t.get('pnl_pct', 0) <= 0]
         
         # Transaction cost summary
-        total_cost = sum(
-            (t.get('price', 0) - t.get('net_price', t.get('price', 0))) * t.get('shares', 0)
-            for t in trades if 'net_price' in t
+        # v8.3 fix: buys and sells both COST money - the v8.2 formula
+        # (price - net_price) * shares has opposite signs for buys vs sells,
+        # so they cancelled each other (~15x underestimate).
+        total_cost = (
+            sum((t['net_price'] - t['price']) * t['shares']
+                for t in trades if t.get('action') == 'BUY' and 'net_price' in t)
+            + sum((t['price'] - t['net_price']) * t['shares']
+                  for t in trades if t.get('action') == 'SELL' and 'net_price' in t)
         )
         
         return {
@@ -2132,10 +2381,15 @@ class WalkForwardValidator:
             else:
                 best_cfg = self.config
             
-            # Run backtest on test period with optimized (or default) config
-            test_prices = prices.iloc[test_start:test_end]
-            test_benchmark = benchmark.iloc[test_start:test_end]
-            
+            # Run backtest on test period with optimized (or default) config.
+            # v8.3 fix: prepend 252d warmup so the engine can trade from day 1
+            # of the test window. v8.2 sliced only the 126d test window, which
+            # is shorter than the engine's 252d warmup -> every period returned
+            # 'Insufficient data' and WFA always came back empty.
+            warm_start = max(0, test_start - 252)
+            test_prices = prices.iloc[warm_start:test_end]
+            test_benchmark = benchmark.iloc[warm_start:test_end]
+
             engine = BacktestEngine(best_cfg)
             result = engine.run(test_prices, test_benchmark, fundamentals)
             
@@ -2251,6 +2505,8 @@ class IntradayMonitor:
         triggered = 0
         for p in positions:
             sym = p['symbol']
+            if sym == self.config.HEDGE_ETF:
+                continue  # v8.3: hedge position is managed by HedgeEngine, not stock stops
             qty = int(float(p['qty']))
             entry = self.entry_prices.get(sym, float(p['avg_entry_price']))
             current = float(p['current_price'])
@@ -2320,10 +2576,13 @@ class IntradayMonitor:
             logger.info("WEEKLY REBALANCE STARTED [DCL Flow: Data→Signal→Order]")
             
             # === D: 刷新数据 (Data Refresh) ===
+            # v8.3 fix (A1): fetch ~400 days. v8.2 fetched 60 days, which
+            # silently disabled momentum (needs 252d), growth and value (126d)
+            # and made BULL regime unreachable (needs 200d MA).
             universe = [s for s in self.config.UNIVERSE if s != 'SPY'] + ['SPY']
             prices_data = {}
             for sym in universe:
-                s = self.client.get_bars(sym, days=60)
+                s = self.client.get_bars(sym, days=400)
                 if len(s) > 30:
                     prices_data[sym] = s
                 time.sleep(0.15)
@@ -2346,13 +2605,18 @@ class IntradayMonitor:
             regime, msignal = self.macro.detect(prices, t)
             weights = self.macro.get_weights(regime)
             
-            mom = MomentumStrategy(self.config).select(prices, benchmark, t)
+            # v8.3: benchmark / hedge ETF are not selectable candidates
+            sel_prices = prices[[c for c in prices.columns
+                                 if c not in ('SPY', self.config.HEDGE_ETF)]]
+            mom = MomentumStrategy(self.config).select(sel_prices, benchmark, t)
             # sector rotation disabled (user request)
-            growth = GrowthStrategy(self.fundamentals, self.config).select(prices, benchmark, t)
-            value = ValueStrategy(self.fundamentals, self.config).select(prices, benchmark, t)
-            defensive = DefensiveStrategy(self.fundamentals, self.config).select(prices, benchmark, t)
-            
+            growth = GrowthStrategy(self.fundamentals, self.config).select(sel_prices, benchmark, t)
+            value = ValueStrategy(self.fundamentals, self.config).select(sel_prices, benchmark, t)
+            defensive = DefensiveStrategy(self.fundamentals, self.config).select(sel_prices, benchmark, t)
+
             combined = self.constructor.combine(mom, {}, growth, value, defensive, weights)
+            # v8.3: wire the advertised 21d-high filter (was dead code)
+            combined = self.constructor.filter_21d_high(combined, prices, t)
             # 全局波动率过滤: 所有策略信号统一检查20日波动率
             combined = self.constructor.filter_by_volatility(combined, prices, t)
             signals = [s[0] for s in sorted(combined.items(), key=lambda x: x[1]['total'], reverse=True)[:self.config.MAX_POSITIONS]]
@@ -2365,13 +2629,19 @@ class IntradayMonitor:
             current_positions = self.client.get_positions()
             current_symbols = {p['symbol'] for p in current_positions}
             
-            # Stock equity考虑hedge active时的压缩
-            stock_equity = equity * self.hedge.get_stock_compression()
+            # Stock equity: hedge compression + regime position factor
+            # (v8.3: v8.2 ignored the regime factor -> stayed ~100% invested
+            # even in PANIC, while the backtest de-risked to 40%)
+            stock_equity = (equity * self.hedge.get_stock_compression()
+                            * msignal.get('position_factor', 1.0))
             target = self.rebalancer.smart_rebalance(prices, current_symbols, signals, stock_equity)
-            
+
             # === O: 执行下单 (Order Execution) ===
             # 必须先卖后买，释放现金
+            # v8.3: never touch the hedge ETF here - it is managed by HedgeEngine
             for sym in current_symbols:
+                if sym == self.config.HEDGE_ETF:
+                    continue
                 if sym not in target:
                     try:
                         qty = int(float(next(p['qty'] for p in current_positions if p['symbol'] == sym)))
@@ -2478,43 +2748,50 @@ class IntradayMonitor:
         # === Step 0: Pre-trade risk check ===
         acct = self.client.get_account()
         equity = float(acct.get('equity', 0))
-        
+
         can_trade, reason = self.risk.check_limits(equity)
         if not can_trade:
             logger.warning(f"Trading blocked: {reason}")
             if 'max_drawdown' in reason or 'daily_loss' in reason:
                 self.risk.emergency_liquidate(self.client)
             return
-        
+
+        # v8.3 (C2): market-hours gating. v8.2 ran stops and the hedge 24/7,
+        # firing market orders on stale data at night/weekends that queued to
+        # the next open. TRADING_ENABLED=False is a shadow mode (no orders).
+        clock = self.client.get_clock()
+        market_open = bool(clock.get('is_open', False))
+
         # === Step 1: D — 刷新数据 (Data Refresh) ===
         # MP-003 FIX: Single positions sync, used consistently throughout
         positions = self.sync_positions()
-        
-        # === Step 2: C — 风控信号生成 (Risk Signal Generation) ===
-        # 基于Step 1的最新持仓价格，生成止损/止盈信号，然后下单
-        if not self.risk.is_rebalancing:
-            self.check_stops(positions)
-        
-        # === Step 2.5: HEDGE — 实时条件对冲 (Intraday VIX-Triggered) ===
-        # DCL: _get_vix(刷新) → evaluate(滞回带信号) → execute(市价单)
-        if self.config.ENABLE_HEDGE:
-            try:
-                hedge_result = self.hedge.intraday_check(self.client, equity)
-                if hedge_result.get('action') in ('activate', 'deactivate'):
-                    logger.critical(f"HEDGE {hedge_result['action'].upper()}: "
-                                   f"VIX={hedge_result.get('vix', 0):.1f} | "
-                                   f"Switch #{hedge_result.get('switches_today', 0)}/2 today")
-                elif hedge_result.get('action') == 'circuit_broken':
-                    logger.warning(f"HEDGE CIRCUIT BROKEN: Max 2 switches reached today")
-            except Exception as e:
-                logger.warning(f"Hedge intraday check error: {e}")
-        
+
+        if self.config.TRADING_ENABLED and market_open:
+            # === Step 2: C — 风控信号生成 (Risk Signal Generation) ===
+            # 基于Step 1的最新持仓价格，生成止损/止盈信号，然后下单
+            if not self.risk.is_rebalancing:
+                self.check_stops(positions)
+
+            # === Step 2.5: HEDGE — 实时条件对冲 (Intraday VIX-Triggered) ===
+            # DCL: _get_vix(刷新) → evaluate(滞回带信号) → execute(市价单)
+            if self.config.ENABLE_HEDGE:
+                try:
+                    hedge_result = self.hedge.intraday_check(self.client, equity)
+                    if hedge_result.get('action') in ('activate', 'deactivate'):
+                        logger.critical(f"HEDGE {hedge_result['action'].upper()}: "
+                                       f"VIX={hedge_result.get('vix', 0):.1f} | "
+                                       f"Switch #{hedge_result.get('switches_today', 0)}/2 today")
+                    elif hedge_result.get('action') == 'circuit_broken':
+                        logger.warning(f"HEDGE CIRCUIT BROKEN: Max 2 switches reached today")
+                except Exception as e:
+                    logger.warning(f"Hedge intraday check error: {e}")
+
         # === Step 3: S+O — 选股信号生成 + 调仓下单 ===
         # do_rebalance内部严格遵循: get_bars(刷新) → 5策略(信号) → submit_order(下单)
-        clock = self.client.get_clock()
-        if self.should_rebalance() and not clock.get('is_open', False):
+        if (self.config.TRADING_ENABLED and self.should_rebalance()
+                and not market_open):
             self.do_rebalance()
-        
+
         # === Step 4: Report ===
         print(self.generate_report(self.sync_positions()))
         self._save_state()
@@ -2575,8 +2852,9 @@ def main():
             'AMZN': 'amzn_2021_2023.csv', 'GOOGL': 'googl_2021_2023.csv',
             'META': 'meta_2021_2023.csv', 'TSLA': 'tsla.csv',
             'JPM': 'jpm.csv', 'UNH': 'unh.csv', 'SPY': 'spy_2021_2023_v2.csv',
+            'SQQQ': 'sqqq.csv',  # v8.3: hedge ETF price history
         }
-        
+
         all_data = {}
         for sym, fname in price_files.items():
             fp = os.path.join(data_dir, fname)
@@ -2588,9 +2866,23 @@ def main():
                     all_data[sym] = df['Close']
                 elif len(df.columns) > 0:
                     all_data[sym] = df.iloc[:, 0]
-        
+
         prices = pd.DataFrame(all_data).ffill().dropna()
         benchmark = prices['SPY']
+
+        # v8.3: real VIX history (CBOE format: DATE,OPEN,HIGH,LOW,CLOSE)
+        vix_series = None
+        vix_fp = os.path.join(data_dir, 'vix.csv')
+        if os.path.exists(vix_fp):
+            vdf = pd.read_csv(vix_fp)
+            vdf.columns = [c.strip().upper() for c in vdf.columns]
+            vix_series = pd.Series(vdf['CLOSE'].values,
+                                   index=pd.to_datetime(vdf['DATE'], format='%m/%d/%Y'),
+                                   name='VIX')
+            vix_series = vix_series.reindex(prices.index, method='ffill')
+            vix_series = vix_series.dropna()
+        else:
+            print("WARNING: data/vix.csv not found - hedge disabled in backtest")
         
         # Fundamentals
         fundamentals = RealtimeFundamentals(config)
@@ -2618,7 +2910,8 @@ def main():
             print("=" * 70)
             
             engine = BacktestEngine(config)
-            results = engine.run(prices, benchmark, fundamentals, use_next_day_open=True)
+            results = engine.run(prices, benchmark, fundamentals,
+                                 use_next_day_open=True, vix=vix_series)
             
             print(f"\n{'Metric':<25} {'Value':>12}")
             print("-" * 40)
@@ -2640,11 +2933,19 @@ def main():
             trailing_50_trades = [t for t in results['trades'] if t.get('reason') == 'trailing_50']
             print(f"  trailing_100 triggers: {len(trailing_100_trades)} (v8.1: 0 - was dead code)")
             print(f"  trailing_50 triggers:  {len(trailing_50_trades)}")
-            
+
             # Check entry prices use net_price
             buy_trades = [t for t in results['trades'] if t['action'] == 'BUY']
             price_mismatch = [t for t in buy_trades if t.get('price') == t.get('net_price')]
             print(f"  entry_price=net_price: {len(buy_trades) - len(price_mismatch)}/{len(buy_trades)} correct")
+
+            # v8.3 verification: hedge, risk limits, SPY exclusion
+            hedge_trades = [t for t in results['trades'] if t['symbol'] == config.HEDGE_ETF]
+            risk_trades = [t for t in results['trades'] if str(t.get('reason', '')).startswith('risk_')]
+            spy_buys = [t for t in buy_trades if t['symbol'] == 'SPY']
+            print(f"  hedge trades (SQQQ): {len(hedge_trades)}")
+            print(f"  risk-limit liquidations: {len(risk_trades)}")
+            print(f"  SPY buys (must be 0): {len(spy_buys)}")
             print("=" * 70)
             
             if args.plot and 'portfolio_values' in results:
@@ -2654,7 +2955,7 @@ def main():
                     dates = prices.index[252:252+len(pv)]
                     
                     fig, axes = plt.subplots(2, 2, figsize=(14, 10))
-                    fig.suptitle('Tenbagger v8.2 Backtest (All Fees + Fixes)', fontsize=14, fontweight='bold')
+                    fig.suptitle('Tenbagger v8.3 Backtest (All Fees + Fixes)', fontsize=14, fontweight='bold')
                     
                     strat_cum = (pv / pv[0] - 1) * 100
                     bench = prices['SPY'].iloc[252:252+len(pv)]
@@ -2695,8 +2996,8 @@ def main():
                         axes[1,1].set_title('Trade P&L Distribution (%)'); axes[1,1].grid(True, alpha=0.3)
                     
                     plt.tight_layout()
-                    plt.savefig(str(config.DATA_DIR.parent / 'v82_backtest.png'), dpi=150, bbox_inches='tight')
-                    print("\nChart saved to v82_backtest.png")
+                    plt.savefig(str(config.DATA_DIR.parent / 'v83_backtest.png'), dpi=150, bbox_inches='tight')
+                    print("\nChart saved to v83_backtest.png")
                     plt.show()
                 except Exception as e:
                     print(f"Plot failed: {e}")
