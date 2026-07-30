@@ -1,20 +1,54 @@
 # Measured Results (v8.2 → v8.4)
 
-> **Bottom line**: after removing look-ahead bias and survivorship-flavored
-> hand-tuning, the strategy as designed **does not beat buy-and-hold SPY**
-> over the test window. The impressive numbers in earlier versions were
-> largely artifacts of static "current" fundamentals applied to past dates.
+> **Bottom line (updated 2026-07-30)**: over the extended window
+> **2020-01-10 → 2026-07-29**, the de-biased v8.4 full-pool strategy
+> **beats SPY by +77pp** (+172.8% vs +95.6%, Sharpe 0.99, beta 0.40),
+> driven by 2024-2026 momentum capture. This number still carries
+> survivorship bias (2026-era constituents) and is an **overestimate** —
+> see caveats. The 10-stock dev universe lags SPY badly (+44.3% vs +95.6%).
 
-Test window: **2020-01-10 → 2023-12-29** (1000 trading days, SPY total return **+25.9%**).
-All versions run the same engine unless noted; transaction costs include
-SEC fee (sell), FINRA TAF (sell), and market-cap-tiered slippage.
+## Extended window: 2020-01-10 → 2026-07-29 (v8.4, PIT fundamentals)
+
+| Universe | Total Return | CAGR | Sharpe | Max DD | vs SPY |
+|---|---|---|---|---|---|
+| 487 stocks | **+172.8%** | +19.9% | 0.99 | -27.6% | **+77.2%** |
+| 10 stocks (dev) | +44.3% | +6.9% | 0.54 | -35.0% | -51.3% |
+
+Yearly (full pool vs SPY):
+
+| Year | Full pool | SPY | Note |
+|---|---|---|---|
+| 2021 | +2.8% | +27.0% | lags in mega-cap-led bull |
+| 2022 | -7.8% | -19.5% | defense + hedge work |
+| 2023 | +22.3% | +24.3% | in line |
+| 2024 | +59.8% | +23.3% | AI-infra momentum capture |
+| 2025 | +18.8% | +16.4% | MDD -27.6% in April tariff crash |
+| 2026 YTD | +24.0% | +7.0% | broad momentum leadership |
+
+Attribution (full pool, 166 symbols traded): top winners NVDA, HPE, WDC,
+VRT, CVNA, MU, TER, LITE, TPL, FIX, LRCX; SQQQ hedge drag **-17.5k USD
+(~2.7%/yr)** over the window. Final positions (2026-07-28): DDOG, LLY,
+DVA, FTNT, FIS, T, ~4% cash, no hedge.
+
+**Caveat — survivorship**: the 487-stock pool is a 2026-07 constituent
+list. The 2024-2026 winners above are precisely the stocks that survived
+into today's index, so the +77pp excess overstates what a 2020 investor
+with only then-current membership would have captured. The 2021 lag
+(+2.8% vs +27.0%) shows pool enrichment alone does not produce alpha —
+the 2024-2026 capture came from the momentum engine rotating into
+trending names (166 distinct symbols traded), but an honest historical
+constituent list would still shave the headline number.
+
+## Original window: 2020-01-10 → 2023-12-29 (reproduces exactly in the extended data)
+
+SPY total return over this window: **+25.9%**.
 
 | Version | Universe | Fundamentals | Total Return | CAGR | Sharpe | Max DD | vs SPY |
 |---|---|---|---|---|---|---|---|
 | v8.2 (original) | 10 stocks | static 2024 snapshot | +29.7% | +9.2% | 1.06 | -12.2% | +3.8% |
 | v8.3 (P0/P1 engine fixes) | 10 stocks | static 2024 snapshot | +73.5% | +20.4% | 1.27 | -18.3% | +47.6% |
-| **v8.4 (PIT, de-biased)** | 10 stocks | SEC XBRL point-in-time | **+3.8%** | +1.3% | 0.16 | -35.0% | **-22.0%** |
-| **v8.4 (PIT, de-biased)** | 487 stocks | SEC XBRL point-in-time | **+15.9%** | +5.1% | 0.37 | -17.6% | **-10.0%** |
+| v8.4 (PIT, de-biased) | 10 stocks | SEC XBRL point-in-time | +3.8% | +1.3% | 0.16 | -35.0% | -22.0% |
+| v8.4 (PIT, de-biased) | 487 stocks | SEC XBRL point-in-time | +15.9% | +5.1% | 0.37 | -17.6% | -10.0% |
 
 Reading guide:
 
@@ -65,6 +99,7 @@ Reading guide:
 
 ```bash
 python download_universe.py                                   # price histories -> data/universe/
+python extend_universe.py                                     # extend all histories to latest day
 python build_pit_fundamentals.py                              # PIT snapshots  -> data/pit_fundamentals_full.json
 python tenbagger_v8_2_production.py --mode backtest                    # 10-stock dev universe
 python tenbagger_v8_2_production.py --mode backtest --universe full    # full pool

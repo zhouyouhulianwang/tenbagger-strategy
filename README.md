@@ -3,10 +3,11 @@
 > **Status**: Active on Alpaca Paper Trading (Account: paper trading 2) for simulation and validation.
 >
 > **Measured results (read first)**: with point-in-time fundamentals and de-biased
-> scoring, the strategy **underperforms buy-and-hold SPY** over 2020-2023
-> (+15.9% vs +25.9% full pool). Earlier headline numbers were inflated by
-> look-ahead data. See [RESULTS.md](RESULTS.md) for the full comparison and
-> methodology before trusting any backtest figure in this repo.
+> scoring, the full-pool strategy beat SPY over 2020-01 → 2026-07 (+172.8% vs
+> +95.6%) but lagged over the 2020-2023 sub-window; all figures carry
+> survivorship bias (2026-era constituents). Earlier headline numbers were
+> inflated by look-ahead data. See [RESULTS.md](RESULTS.md) for the full
+> comparison and methodology before trusting any backtest figure in this repo.
 
 Multi-factor quantitative trading system with real-time conditional hedge, 520-stock universe (S&P 500 + NASDAQ 100), and six-layer risk defense.
 
