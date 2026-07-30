@@ -1,6 +1,12 @@
-# Tenbagger Strategy v8.2
+# Tenbagger Strategy v8.4
 
 > **Status**: Active on Alpaca Paper Trading (Account: paper trading 2) for simulation and validation.
+>
+> **Measured results (read first)**: with point-in-time fundamentals and de-biased
+> scoring, the strategy **underperforms buy-and-hold SPY** over 2020-2023
+> (+15.9% vs +25.9% full pool). Earlier headline numbers were inflated by
+> look-ahead data. See [RESULTS.md](RESULTS.md) for the full comparison and
+> methodology before trusting any backtest figure in this repo.
 
 Multi-factor quantitative trading system with real-time conditional hedge, 520-stock universe (S&P 500 + NASDAQ 100), and six-layer risk defense.
 
@@ -40,7 +46,9 @@ VIX <= 24.75  -> DEACTIVATE: Sell all SQQQ market order
 Switches > 2/day -> CIRCUIT BROKEN: No more switches today
 ```
 
-**Research**: Permanent hedge costs 9%/year; conditional hedge (VIX>=25) delivers Sharpe 2.56, max drawdown -23.2%, 2022 bear market +29.8% vs +13.3% baseline.
+**Research**: Permanent hedge costs 9%/year; conditional hedge (VIX>=25) reduces drawdowns in backtests.
+*(Earlier figures quoted here — Sharpe 2.56, 2022 bear +29.8% — predate the
+v8.4 de-biasing and should not be relied on; see [RESULTS.md](RESULTS.md).)*
 
 ### Five Sub-Strategies with Dynamic Weighting
 
@@ -123,7 +131,15 @@ Features:
 ### Backtest
 
 ```bash
-python tenbagger_v8_2_production.py --mode backtest --start 2019-01-01 --end 2024-01-01 --plot
+# 10-stock dev universe (data/ root CSVs)
+python tenbagger_v8_2_production.py --mode backtest
+
+# Full 487-stock validated universe (requires data pipeline below)
+python tenbagger_v8_2_production.py --mode backtest --universe full
+
+# Data pipeline (price histories + point-in-time fundamentals)
+python download_universe.py
+python build_pit_fundamentals.py
 ```
 
 ### Walk-Forward Validation
@@ -172,12 +188,17 @@ UNIVERSE = [...]  # S&P 500 + NASDAQ 100 + SPY
 
 ```
 tenbagger-strategy/
-|-- tenbagger_v8_2_production.py   # Main system (2616 lines)
+|-- tenbagger_v8_2_production.py   # Main system (v8.4, 3139 lines)
+|-- download_universe.py           # Price history downloader (Nasdaq daily)
+|-- build_pit_fundamentals.py      # SEC XBRL point-in-time fundamentals builder
+|-- RESULTS.md                     # Measured backtest results v8.2 -> v8.4 (read first)
 |-- config.json                     # Optional: override Config
 |-- state.json                      # Runtime state (positions, entry prices)
-|-- data/                           # Cache directory
+|-- data/                           # Data directory
+|   |-- universe/                   # 489 full-universe price histories
+|   |-- pit_fundamentals.json       # PIT snapshots (10-stock dev universe)
+|   |-- pit_fundamentals_full.json  # PIT snapshots (504 symbols, incl. sectors)
 |   |-- .keys                       # Encrypted API keys
-|   |-- fundamentals_v82.json       # Fundamentals cache
 |-- logs/
 |   |-- trading.log                 # Detailed debug log
 |   |-- paper_trading.log           # Monitor output
