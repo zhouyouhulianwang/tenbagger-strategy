@@ -18,7 +18,8 @@ ET = ZoneInfo('America/New_York')
 LOG = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'logs', 'initial_sync.log')
 
 # v8.6 targets from the approved pre-rebalance report (weights sum to 0.60)
-TARGET_W = {'PEG': 0.162, 'EIX': 0.124, 'PG': 0.114, 'EG': 0.079, 'T': 0.069, 'MKC': 0.052}
+# v8.7 NEUTRAL regime targets (approved 2026-07-30, pre-rebalance report as of 2026-07-29)
+TARGET_W = {'DVA': 0.278, 'DDOG': 0.156, 'FTNT': 0.134, 'EG': 0.111, 'T': 0.098, 'MKC': 0.073}
 WINDOW_START = '10:00'
 WINDOW_END = '15:30'
 

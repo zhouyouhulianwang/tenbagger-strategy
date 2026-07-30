@@ -1432,7 +1432,12 @@ class MacroTiming:
         if current_vol < 0.18 and above_200d and mom_20 > 0:
             regime = 'BULL'
             pf, hr = 1.0, 0.0
-        elif current_vol < 0.25 and above_50d:
+        elif current_vol < 0.25 and above_200d:
+            # v8.7 (data-driven, approved 2026-07-30): NEUTRAL gated on the
+            # 200d trend instead of the noisy 50d MA. Regime sensitivity
+            # battery (data/regime_experiments.json): +326.9%/Sharpe 1.34/
+            # MDD -23.2% vs base +240.0%/1.20/-24.7%; wins both segments
+            # (2020-23 +53.8%, 2024-26 +178.4%; SPY +25.5%/+56.7%).
             regime = 'NEUTRAL'
             pf, hr = 0.85, 0.05
         elif current_vol < 0.35:
