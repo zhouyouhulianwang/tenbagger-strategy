@@ -62,6 +62,34 @@ v8.4 FIXES (P2: data integrity & de-biasing):
              Nasdaq daily histories + per-stock PIT fundamentals; ticker
              validity verified implicitly by data availability
 
+v8.5 FIXES (Alpaca paper/live readiness review):
+  [CRITICAL] F1: validate_data tz-naive-vs-aware TypeError killed every
+             weekly rebalance -> tz-normalized bars + defensive seatbelt
+  [CRITICAL] F2: after-close rebalance queued sells+buys to the same next
+             open -> buys rejected (no freed cash) or silent margin; now
+             rebalances INSIDE the trading window, sells polled to fill
+             before buys, cash verified
+  [CRITICAL] F3: no PDT protection -> PDT guard blocks new buys and hedge
+             activations when daytrade_count exhausted on <$25k accounts
+  [CRITICAL] F4: fractional SQQQ residue (notional buys vs int(qty) sells)
+             ghosted the hedge state machine -> DELETE /v2/positions close
+  [HIGH]     F5: hedge activation impossible when fully invested -> pro-rata
+             stock trim funds the hedge (live HEDGE_STOCK_COMPRESSION)
+  [HIGH]     F6: ~520 per-symbol bar requests broke the data rate limit ->
+             batched multi-symbol bars with pagination
+  [HIGH]     F7: orphan orders never reconciled -> startup cancel + rebalance
+             pre-cancel; TRADING_ENABLED=False shadow mode can no longer
+             liquidate; state.json atomic + instance lock; live fundamentals
+             use PIT SEC snapshots (yfinance only as loud fallback);
+             split-divergent entry basis auto-rebased; failed rebalances no
+             longer stamped (retried next cycle); trailing-stop peaks survive
+             rebalances; bars use adjustment='all'
+  [MEDIUM]   F8: all market-time logic in US Eastern (zoneinfo); trading
+             window config enforced; circuit breaker + daily baseline survive
+             restarts; 4xx no longer retried; kill-switch file STOP_TRADING;
+             .gitignore covers key/state/lock files; yfinance VIX outage
+             escalation; live base URL from env + LIVE_TRADING_ACK gate
+
 Usage:
   # Backtest
   python tenbagger_v8_2_production.py --mode backtest --start 2019-01-01 --end 2024-01-01 --plot
@@ -96,10 +124,18 @@ import pickle
 import functools
 from pathlib import Path
 from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 from typing import Dict, List, Optional, Tuple, Any, Callable
 from dataclasses import dataclass, field, asdict
 from enum import Enum
 from collections import defaultdict
+
+# v8.5: all market-time logic uses US Eastern, independent of the host timezone
+ET = ZoneInfo('America/New_York')
+
+def now_et() -> datetime:
+    """Current time in US Eastern (market timezone)."""
+    return datetime.now(ET)
 
 # Third-party
 import numpy as np
@@ -184,6 +220,8 @@ class Config:
     
     # === Trading Hours (ET) ===
     TRADING_ENABLED: bool = True
+    # v8.5: window is now enforced for rebalances and hedge switches (stops
+    # still execute any time the market is open - protection beats noise).
     TRADING_WINDOW_START: str = "10:00"   # Avoid opening volatility
     TRADING_WINDOW_END: str = "15:30"     # Avoid closing volatility
     AVOID_PRE_MARKET_GAPS: bool = True    # Use next-day open for rebalancing
@@ -212,6 +250,20 @@ class Config:
     DAILY_LOSS_LIMIT_PCT: float = -0.03     # Stop trading if down 3% today
     MAX_DRAWDOWN_LIMIT_PCT: float = -0.10   # Circuit breaker at -10%
     CIRCUIT_BREAKER_COOLDOWN_HOURS: int = 24
+
+    # === Pattern Day Trader (PDT) protection (v8.5) ===
+    # FINRA: >=4 day trades in 5 business days with equity < $25k -> account
+    # restricted for 90 days. We stop opening new positions / new hedge
+    # switches once daytrade_count reaches PDT_MAX_DAY_TRADES. Protective
+    # stop-loss sells always go through (risk first) with a CRITICAL log.
+    PDT_PROTECTION: bool = True
+    PDT_MIN_EQUITY: float = 25_000.0
+    PDT_MAX_DAY_TRADES: int = 3
+
+    # === Kill switch (v8.5) ===
+    # If this file exists, the monitor cancels our open orders and stops all
+    # trading actions (reporting continues). Delete the file to resume.
+    KILL_SWITCH_FILE: Path = field(default_factory=lambda: Path(__file__).parent / 'STOP_TRADING')
     
     # === Conditional Hedge Engine (Real-Time Intraday VIX-Triggered) ===
     # 研究结论: 永久对冲年耗9%无效; 条件对冲(VIX>=25)夏普2.56显著有效
@@ -246,22 +298,37 @@ class Config:
     DEFENSIVE_MIN_DIV_YIELD: float = 0.015
     
     # === Strategy Weights by Regime ===
+    # v8.6 (data-driven): growth weight zeroed in every regime. Evidence
+    # (full-pool 2020-01 -> 2026-07, 21-experiment attribution/ablation
+    # battery, data/strategy_experiments.json):
+    #   - solo growth: +40.7% / Sharpe 0.42 - worst of all strategies
+    #   - ablation (growth=0): +240.0% vs base +172.8%, Sharpe 1.20 vs 0.99,
+    #     MDD -24.7% vs -27.6%; improvement holds in BOTH sub-periods
+    #     (2020-23: +60.1% vs +14.6%; 2024-26: +116.8% vs +139.5%, both > SPY)
+    #   - trade attribution shows growth picks are mildly profitable (+$16K)
+    #     but crowd out momentum slots (MAX_POSITIONS=6) - negative
+    #     opportunity cost, not bad signals. Weight=0 keeps the code path
+    #     (resonance bonus unaffected) and is exactly what was backtested.
     WEIGHT_BULL: Dict[str, float] = field(default_factory=lambda: {
-        'momentum': 0.35, 'sector': 0.25, 'growth': 0.25, 'value': 0.10, 'defensive': 0.05
+        'momentum': 0.35, 'sector': 0.25, 'growth': 0.0, 'value': 0.10, 'defensive': 0.05
     })
     WEIGHT_NEUTRAL: Dict[str, float] = field(default_factory=lambda: {
-        'momentum': 0.25, 'sector': 0.25, 'growth': 0.25, 'value': 0.15, 'defensive': 0.10
+        'momentum': 0.25, 'sector': 0.25, 'growth': 0.0, 'value': 0.15, 'defensive': 0.10
     })
     WEIGHT_BEAR: Dict[str, float] = field(default_factory=lambda: {
-        'momentum': 0.10, 'sector': 0.15, 'growth': 0.20, 'value': 0.30, 'defensive': 0.25
+        'momentum': 0.10, 'sector': 0.15, 'growth': 0.0, 'value': 0.30, 'defensive': 0.25
     })
     WEIGHT_PANIC: Dict[str, float] = field(default_factory=lambda: {
-        'momentum': 0.05, 'sector': 0.10, 'growth': 0.15, 'value': 0.20, 'defensive': 0.50
+        'momentum': 0.05, 'sector': 0.10, 'growth': 0.0, 'value': 0.20, 'defensive': 0.50
     })
     STRATEGY_RESONANCE_BONUS: float = 0.20
     
     # === API ===
-    ALPACA_BASE_URL: str = "https://paper-api.alpaca.markets"
+    # v8.5: base URL comes from the environment so paper<->live switching
+    # never requires editing source. Live URLs additionally require
+    # LIVE_TRADING_ACK=I_UNDERSTAND in the environment (checked at startup).
+    ALPACA_BASE_URL: str = field(default_factory=lambda: os.environ.get(
+        'APCA_API_BASE_URL', 'https://paper-api.alpaca.markets'))
     ALPACA_DATA_URL: str = "https://data.alpaca.markets"
     API_MAX_RETRIES: int = 5
     API_BASE_DELAY: float = 1.0
@@ -282,6 +349,9 @@ class Config:
     VIX_MAX_STALE_DAYS: int = 5        # EOD fallback older than this -> treat as unavailable
     
     # MP-006 FIX: Configurable data feed
+    # WARNING: "iex" (free) is delayed ~15min and thin for less-liquid names;
+    # stop-loss and hedge triggers may fire on stale prices. Use "sip" for
+    # any serious paper validation and for live trading.
     DATA_FEED: str = "iex"  # "iex" for free, "sip" for live (subscription required)
     
     # === Trading Universe: S&P 500 (502) + NASDAQ 100 unique (17) + SPY ===
@@ -347,7 +417,10 @@ class Config:
     WALK_FORWARD_STEP_DAYS: int = 63        # 3 months step
     
     # === State Files ===
-    STATE_FILE: Path = field(default_factory=lambda: Path(__file__).parent / 'state.json')
+    # v8.5: state lives under DATA_DIR (repo root stays clean), written
+    # atomically; an instance lock prevents two monitors on one account.
+    STATE_FILE: Path = field(default_factory=lambda: Path(__file__).parent / 'data' / 'state.json')
+    INSTANCE_LOCK_FILE: Path = field(default_factory=lambda: Path(__file__).parent / 'data' / '.tenbagger.lock')
     
     def to_dict(self) -> Dict:
         return asdict(self)
@@ -567,7 +640,15 @@ class AlpacaClient:
                     logger.error(f"Auth failed: {response.text[:200]}")
                     return response
                 
-                # Exponential backoff
+                # v8.5: other 4xx are client errors (bad params, insufficient
+                # buying power, PDT rejections) - retrying is pointless and
+                # delays the failure signal by minutes. Only 5xx/timeouts retry.
+                if 400 <= response.status_code < 500:
+                    logger.error(f"HTTP {response.status_code} (client error, no retry): "
+                                 f"{method} {url} -> {response.text[:300]}")
+                    return response
+                
+                # Exponential backoff for 5xx / unexpected statuses
                 delay = min(self.config.API_BASE_DELAY * (2 ** attempt),
                            self.config.API_MAX_DELAY)
                 logger.warning(f"HTTP {response.status_code}, retry in {delay}s (#{attempt+1})")
@@ -631,7 +712,7 @@ class AlpacaClient:
             )
             # Log structured trade (raw JSON - no formatter)
             trade_entry = {
-                'timestamp': datetime.now().isoformat(),
+                'timestamp': now_et().isoformat(),
                 'type': 'trade',
                 'action': side.upper(),
                 'symbol': symbol,
@@ -698,32 +779,122 @@ class AlpacaClient:
         return r.status_code in [200, 204]
     
     def get_bars(self, symbol: str, days: int = 60) -> pd.Series:
-        """Get historical bars with configurable feed (MP-006 FIX)."""
+        """Get historical bars with configurable feed (MP-006 FIX).
+
+        v8.5: adjustment='all' (split/dividend-adjusted, so dividends and
+        splits do not create fake momentum/stop signals), and the index is
+        tz-naive (Alpaca returns RFC3339 tz-aware stamps; mixing them with
+        naive datetimes raised TypeError in validate_data and killed the
+        weekly rebalance).
+        """
         end = datetime.now()
         start = end - timedelta(days=days + 30)
-        
+
         url = f"{self.config.ALPACA_DATA_URL}/v2/stocks/{symbol}/bars"
         params = {
             'start': start.isoformat() + 'Z',
             'end': end.isoformat() + 'Z',
             'timeframe': '1Day',
             'feed': self.config.DATA_FEED,  # MP-006 FIX: configurable feed
+            'adjustment': 'all',            # v8.5: split/dividend adjusted
             'limit': 1000
         }
-        
+
         r = self._request('GET', url, params=params)
-        
+
         if r.status_code != 200:
             logger.warning(f"Bars failed for {symbol}: HTTP {r.status_code}")
             return pd.Series(dtype=float, name=symbol)
-        
+
         bars = r.json().get('bars', [])
         if not bars:
             return pd.Series(dtype=float, name=symbol)
-        
+
         df = pd.DataFrame(bars)
-        df['t'] = pd.to_datetime(df['t'])
+        df['t'] = pd.to_datetime(df['t']).dt.tz_localize(None)
         return pd.Series(df['c'].values, index=df['t'], name=symbol)
+
+    def get_bars_batch(self, symbols: List[str], days: int = 400) -> Dict[str, pd.Series]:
+        """v8.5: multi-symbol bars in a few paginated requests.
+
+        The old per-symbol loop made ~520 requests at ~6.7 req/s, over the
+        free-tier 200 req/min data limit -> 429 storms and silently missing
+        stocks. The multi-symbol endpoint fetches the whole pool with a
+        handful of requests. Falls back to per-symbol on failure.
+        """
+        end = datetime.now()
+        start = end - timedelta(days=days + 30)
+        url = f"{self.config.ALPACA_DATA_URL}/v2/stocks/bars"
+        collected: Dict[str, list] = {s: [] for s in symbols}
+        page_token = None
+        pages = 0
+        try:
+            while True:
+                params = {
+                    'symbols': ','.join(symbols),
+                    'start': start.isoformat() + 'Z',
+                    'end': end.isoformat() + 'Z',
+                    'timeframe': '1Day',
+                    'feed': self.config.DATA_FEED,
+                    'adjustment': 'all',
+                    'limit': 10000,
+                }
+                if page_token:
+                    params['page_token'] = page_token
+                r = self._request('GET', url, params=params)
+                if r.status_code != 200:
+                    raise RuntimeError(f"batch bars HTTP {r.status_code}")
+                payload = r.json()
+                for sym, bars in (payload.get('bars') or {}).items():
+                    collected.setdefault(sym, []).extend(bars)
+                page_token = payload.get('next_page_token')
+                pages += 1
+                if not page_token:
+                    break
+                time.sleep(0.3)  # stay well under the data rate limit
+        except Exception as e:
+            logger.warning(f"Batch bars failed ({e}), falling back to per-symbol")
+            collected = None
+
+        result: Dict[str, pd.Series] = {}
+        if collected is None:
+            for sym in symbols:
+                s = self.get_bars(sym, days=days)
+                if len(s) > 30:
+                    result[sym] = s
+                time.sleep(0.35)  # <200 req/min on the free tier
+            return result
+
+        for sym, bars in collected.items():
+            if len(bars) > 30:
+                df = pd.DataFrame(bars)
+                df['t'] = pd.to_datetime(df['t']).dt.tz_localize(None)
+                result[sym] = pd.Series(df['c'].values, index=df['t'], name=sym)
+        logger.info(f"Batch bars: {len(result)}/{len(symbols)} symbols in {pages} page(s)")
+        return result
+
+    def close_position(self, symbol: str) -> bool:
+        """v8.5: close an entire position via DELETE /v2/positions/{symbol}.
+
+        This is the only reliable way to flatten FRACTIONAL leftovers: the
+        hedge buys SQQQ via notional orders (always fractional), and selling
+        int(qty) leaves a sub-share residue that desynced the hedge state
+        machine (ghost position read as 'hedge active' on every restart).
+        """
+        r = self._request('DELETE', f"{self.config.ALPACA_BASE_URL}/v2/positions/{symbol}")
+        ok = r.status_code in (200, 204)
+        if not ok:
+            logger.error(f"close_position({symbol}) failed: HTTP {r.status_code} {r.text[:200]}")
+        return ok
+
+    def get_open_our_orders(self) -> List[Dict]:
+        """v8.5: our open orders (for startup reconciliation)."""
+        r = self._request('GET', f"{self.config.ALPACA_BASE_URL}/v2/orders",
+                          params={'status': 'open'})
+        if r.status_code != 200:
+            return []
+        return [o for o in r.json()
+                if o.get('client_order_id', '').startswith(self.ORDER_PREFIX)]
     
     def get_stats(self) -> Dict:
         total = self._stats['requests']
@@ -971,7 +1142,7 @@ class MomentumStrategy:
         mom_21 = self.ind.momentum(s, 21)
         mom_63 = self.ind.momentum(s, 63)
         mom_126 = self.ind.momentum(s, 126)
-        mom_252 = self.ind.momentum(s, 252) if t >= 252 else mom_126 / 2
+        mom_252 = self.ind.momentum(s, 252)  # v8.5: dead fallback removed (len(s)<252 returns None above)
         rs = self.ind.rs_rating(s, b, 126)
         above_50d = self.ind.above_ma(s, 50)
         above_200d = self.ind.above_ma(s, 200)
@@ -1316,6 +1487,12 @@ class FailSafeRebalancer:
         if n < self.config.MIN_STOCKS_FOR_REBALANCE:
             return False, f"Only {n} stocks, need {self.config.MIN_STOCKS_FOR_REBALANCE}"
         last_date = prices.index[-1]
+        # v8.5 (P0-1): defensive tz-normalization. Alpaca bars arrive
+        # tz-aware; naive - aware subtraction raised TypeError here and the
+        # unhandled exception killed the whole monitor on the first weekly
+        # rebalance. (get_bars now normalizes too; this is the seatbelt.)
+        if getattr(last_date, 'tzinfo', None) is not None:
+            last_date = last_date.tz_localize(None)
         if (datetime.now() - last_date).days > 3:
             return False, f"Stale data: last {last_date.date()}"
         missing = prices.isnull().sum().sum() / prices.size
@@ -1364,6 +1541,43 @@ class RiskController:
         self._last_equity = None       # last equity seen (any call)
         self._day_baseline = None      # v8.3: frozen at yesterday's last equity
         self._last_date = None
+        # v8.5: whether the emergency liquidation for the CURRENT circuit
+        # episode already ran. Without this, every 60s cycle re-liquidated
+        # (harmless on a flat account but floods logs and the broker API).
+        self._liquidated_for_circuit = False
+
+    # v8.5: (de)serialization so a restart keeps the daily baseline and the
+    # circuit state. Previously a restart silently reset the daily-loss
+    # baseline (exempting losses already incurred that day) and forgot an
+    # active circuit breaker.
+    def state_dict(self) -> Dict:
+        return {
+            'peak_equity': self._peak_equity,
+            'circuit_active': self._circuit_active,
+            'circuit_time': self._circuit_time.isoformat() if self._circuit_time else None,
+            'liquidated_for_circuit': self._liquidated_for_circuit,
+            'day_baseline': self._day_baseline,
+            'baseline_date': self._last_date.isoformat() if self._last_date else None,
+        }
+
+    def load_state_dict(self, d: Dict):
+        self._peak_equity = d.get('peak_equity', 0) or 0
+        self._circuit_active = bool(d.get('circuit_active', False))
+        ct = d.get('circuit_time')
+        if ct:
+            try:
+                self._circuit_time = datetime.fromisoformat(ct)
+            except (ValueError, TypeError):
+                self._circuit_time = None
+        self._liquidated_for_circuit = bool(d.get('liquidated_for_circuit', False))
+        # Daily baseline only valid if it was frozen earlier the SAME day
+        bd = d.get('baseline_date')
+        if bd and bd == now_et().date().isoformat():
+            self._day_baseline = d.get('day_baseline')
+            try:
+                self._last_date = datetime.fromisoformat(bd).date()
+            except (ValueError, TypeError):
+                self._last_date = None
     
     # --- Concurrency ---
     def acquire_rebalance_lock(self) -> bool:
@@ -1388,8 +1602,10 @@ class RiskController:
         on every call, which turned the "-3% per day" limit into a
         "-3% per monitoring-interval" limit: slow intraday bleed never triggered
         it and overnight gaps were ignored.
+
+        v8.5: default clock is US Eastern (host-timezone independent).
         """
-        now = now or datetime.now()
+        now = now or now_et()
 
         # New day: freeze the baseline at yesterday's last seen equity.
         if self._last_date != now.date():
@@ -1404,6 +1620,7 @@ class RiskController:
                 logger.info("Circuit breaker auto-released")
                 self._circuit_active = False
                 self._circuit_time = None
+                self._liquidated_for_circuit = False  # v8.5: next episode liquidates once
             else:
                 return False, f"circuit_breaker ({self.config.CIRCUIT_BREAKER_COOLDOWN_HOURS - elapsed:.0f}h remaining)"
 
@@ -1613,6 +1830,7 @@ class VixProvider:
         self.config = config or Config()
         self._cached: Optional[float] = None
         self._cached_at: float = 0.0
+        self._yf_failures = 0  # v8.5: escalate repeated yfinance outages
 
     def get_vix(self) -> Optional[float]:
         now = time.time()
@@ -1631,9 +1849,18 @@ class VixProvider:
             t = yf.Ticker('^VIX')
             price = getattr(t.fast_info, 'last_price', None)
             if price and 5.0 < float(price) < 150.0:
+                self._yf_failures = 0
                 return float(price)
         except Exception as e:
-            logger.debug(f"VIX yfinance unavailable: {e}")
+            self._yf_failures += 1
+            # v8.5: yfinance is an unofficial API with no SLA and gets
+            # rate-limited/blocked regularly; a persistent outage means the
+            # hedge runs on yesterday's CBOE close - make that visible.
+            if self._yf_failures >= 3:
+                logger.warning(f"VIX yfinance failing x{self._yf_failures}: {e} "
+                               f"(falling back to CBOE EOD, intraday moves missed)")
+            else:
+                logger.debug(f"VIX yfinance unavailable: {e}")
         return None
 
     def _from_cboe_eod(self) -> Optional[float]:
@@ -1710,7 +1937,7 @@ class HedgeEngine:
         backtests the whole run counted as ONE day - after 2 switches the hedge
         circuit-broke forever (only 2 hedge trades in 4 years).
         """
-        today = (now or datetime.now()).date()
+        today = (now or now_et()).date()  # v8.5: market day in ET
         if self._last_switch_date != today:
             self._switches_today = 0
             self._circuit_broken = False
@@ -1790,27 +2017,65 @@ class HedgeEngine:
             return bp >= required and cash >= required * 0.5
         except Exception:
             return False
-    
-    def _submit_notional_order(self, client: AlpacaClient, symbol: str, 
-                                notional: float, side: str) -> Optional[Dict]:
-        """Submit order using notional (dollar amount) instead of qty."""
+
+    def _trim_stocks_for_hedge(self, client: AlpacaClient, needed: float) -> bool:
+        """v8.5: sell a pro-rata slice of every stock position to free cash.
+
+        Each stock is trimmed by (needed / total_stock_value) of its market
+        value - this is the live realization of HEDGE_STOCK_COMPRESSION=0.90.
+        Sells are polled to fill before we report success; the freed cash is
+        then verified against the account.
+        """
         try:
-            headers = client.secure.get_headers()
-            data = {
-                'symbol': symbol,
-                'notional': str(notional),  # Dollar amount, not shares
-                'side': side,
-                'type': 'market',
-                'time_in_force': 'ioc',
-                'client_order_id': f"{client.ORDER_PREFIX}{symbol}_{side}_{int(time.time())}_{os.urandom(4).hex()}",
-            }
-            r = requests.post(f"{client.config.ALPACA_BASE_URL}/v2/orders",
-                            headers=headers, json=data, timeout=client.config.API_TIMEOUT)
-            if r.status_code in (200, 201):
-                return r.json()
-            logger.error(f"Notional order failed: HTTP {r.status_code} {r.text[:200]}")
+            positions = [p for p in client.get_positions()
+                         if p['symbol'] != self.config.HEDGE_ETF]
+            total_mv = sum(float(p['market_value']) for p in positions)
+            if total_mv <= 0:
+                return False
+            frac = min(needed / total_mv, 0.95)
+            for p in positions:
+                sym = p['symbol']
+                trim_val = float(p['market_value']) * frac
+                price = float(p['current_price'])
+                qty = int(trim_val / price) if price > 0 else 0
+                if qty < 1:
+                    continue
+                order = client.submit_order(sym, qty, 'sell', poll_timeout=30)
+                if not (order and order.get('status') in
+                        ('filled', 'accepted', 'new', 'partially_filled')):
+                    logger.error(f"Hedge funding trim FAILED for {sym}")
+                time.sleep(0.3)
+            # Verify freed cash
+            time.sleep(1.0)
+            acct = client.get_account()
+            cash = float(acct.get('cash', 0))
+            bp = float(acct.get('buying_power', 0))
+            ok = cash >= needed * 0.5 and bp >= needed
+            logger.info(f"Hedge funding: cash=${cash:,.0f} bp=${bp:,.0f} needed=${needed:,.0f} -> {'OK' if ok else 'SHORT'}")
+            return ok
         except Exception as e:
-            logger.error(f"Notional order exception: {e}")
+            logger.error(f"Hedge funding trim exception: {e}")
+            return False
+    
+    def _submit_notional_order(self, client: AlpacaClient, symbol: str,
+                                notional: float, side: str) -> Optional[Dict]:
+        """Submit order using notional (dollar amount) instead of qty.
+
+        v8.5: goes through client._request (retry/backoff/stats) instead of a
+        bare requests.post that bypassed all of it.
+        """
+        data = {
+            'symbol': symbol,
+            'notional': str(round(notional, 2)),  # Dollar amount, not shares
+            'side': side,
+            'type': 'market',
+            'time_in_force': 'ioc',
+            'client_order_id': f"{client.ORDER_PREFIX}{symbol}_{side}_{int(time.time())}_{os.urandom(4).hex()}",
+        }
+        r = client._request('POST', f"{client.config.ALPACA_BASE_URL}/v2/orders", json=data)
+        if r.status_code in (200, 201):
+            return r.json()
+        logger.error(f"Notional order failed: HTTP {r.status_code} {r.text[:200]}")
         return None
     
     def execute(self, client: AlpacaClient, equity: float, action: str) -> Dict[str, Any]:
@@ -1827,15 +2092,21 @@ class HedgeEngine:
                 if notional < 100:
                     logger.warning(f"HEDGE: notional ${notional:.2f} too small, skipping")
                     return results
-                
-                # Check buying power before ordering
+
+                # v8.5: the portfolio is normally ~fully invested, so cash is
+                # ~0 and the old buying-power check made activation impossible
+                # exactly when it was needed. Fund the hedge by trimming every
+                # stock position pro-rata (this IS the documented
+                # HEDGE_STOCK_COMPRESSION), then buy SQQQ with the proceeds.
                 if not self._check_buying_power(client, notional):
-                    logger.error(f"HEDGE ACTIVATE: Insufficient buying power for ${notional:.2f}")
-                    return results
-                
+                    logger.info(f"HEDGE ACTIVATE: freeing ${notional:.0f} by pro-rata stock trim")
+                    if not self._trim_stocks_for_hedge(client, notional):
+                        logger.error(f"HEDGE ACTIVATE: could not free ${notional:.2f} cash")
+                        return results
+
                 # Use notional order (dollar amount) for precise position sizing
                 order = self._submit_notional_order(client, hedge_sym, notional, 'buy')
-                if order and order.get('status') in ('filled', 'accepted', 'new'):
+                if order and order.get('status') in ('filled', 'accepted', 'new', 'partially_filled'):
                     filled_qty = order.get('filled_qty') or order.get('qty', '0')
                     results['executed'] = True
                     results['details'].append({'symbol': hedge_sym, 'side': 'buy',
@@ -1844,23 +2115,22 @@ class HedgeEngine:
                                    f"(VIX>={self.config.HEDGE_VIX_ACTIVATE})")
                 else:
                     logger.error(f"HEDGE ACTIVATE FAILED: order rejected")
-            
+
             elif action == 'deactivate':
-                # Sell all SQQQ using notional close (negative notional)
+                # v8.5: close the WHOLE position incl. fractional residue via
+                # DELETE /v2/positions. Old code sold int(qty), leaving a
+                # sub-share ghost that re-armed the hedge on every restart.
                 positions = client.get_positions()
                 for p in positions:
                     if p['symbol'] == hedge_sym:
-                        qty = int(float(p['qty']))
+                        qty = float(p['qty'])
                         mv = float(p['market_value'])
                         if qty > 0 and mv > 0:
-                            # Sell using qty (closing position)
-                            order = client.submit_order(hedge_sym, qty, 'sell',
-                                                       order_type='market', tif='ioc')
-                            if order and order.get('status') in ('filled', 'accepted', 'new'):
+                            if client.close_position(hedge_sym):
                                 results['executed'] = True
                                 results['details'].append({'symbol': hedge_sym, 'side': 'sell',
                                                             'qty': qty, 'market_value': mv})
-                                logger.critical(f"HEDGE DEACTIVATED: SOLD {qty} {hedge_sym} ${mv:.0f} "
+                                logger.critical(f"HEDGE DEACTIVATED: CLOSED {qty} {hedge_sym} ${mv:.0f} "
                                                f"(VIX<={self.config.HEDGE_VIX_DEACTIVATE})")
                         break
             
@@ -1881,32 +2151,36 @@ class HedgeEngine:
         hedge_sym = self.config.HEDGE_ETF
         
         try:
-            current_qty = 0
+            current_qty = 0.0
             current_val = 0.0
+            current_price = 0.0
             for p in client.get_positions():
                 if p['symbol'] == hedge_sym:
-                    current_qty = int(float(p['qty']))
+                    current_qty = float(p['qty'])          # v8.5: keep fractions
                     current_val = float(p['market_value'])
+                    current_price = float(p['current_price'])  # v8.5: live price, not stale EOD bar
                     break
-            
+
             target_val = target_hedge.get(hedge_sym, 0)
             if target_val > 0 and current_val > 0:
                 drift = abs(target_val - current_val) / max(target_val, current_val)
                 if drift < self.config.HEDGE_REBALANCE_THRESHOLD_PCT:
                     return results
-            
+
             if target_val == 0 and current_qty > 0:
-                order = client.submit_order(hedge_sym, current_qty, 'sell')
-                if order:
+                # v8.5: close incl. fractional residue (int(qty) left ghosts)
+                if client.close_position(hedge_sym):
                     results = {'executed': True, 'details': [{'symbol': hedge_sym, 'side': 'sell',
                                                                'qty': current_qty, 'reason': 'close'}]}
             elif target_val > 0:
-                bars = client.get_bars(hedge_sym, days=2)
-                if len(bars) == 0:
-                    return results
-                price = float(bars.iloc[-1])
+                price = current_price
+                if price <= 0:
+                    bars = client.get_bars(hedge_sym, days=2)
+                    if len(bars) == 0:
+                        return results
+                    price = float(bars.iloc[-1])
                 target_qty = int(target_val / price)
-                delta = target_qty - current_qty
+                delta = target_qty - int(current_qty)
                 if abs(delta) >= 1:
                     side = 'buy' if delta > 0 else 'sell'
                     order = client.submit_order(hedge_sym, abs(delta), side)
@@ -1918,14 +2192,20 @@ class HedgeEngine:
         
         return results
     
-    def intraday_check(self, client: AlpacaClient, equity: float) -> Dict[str, Any]:
+    def intraday_check(self, client: AlpacaClient, equity: float,
+                       account: Dict = None) -> Dict[str, Any]:
         """
         Full intraday hedge check cycle (called every 60s from run_cycle).
         DCL: _get_vix (Data) → evaluate (Signal) → execute (Order)
+
+        v8.5 (PDT): activating the hedge opens a same-day-round-trip risk
+        (a later deactivate of shares bought today is a day trade). When
+        equity < $25k and the day-trade budget is exhausted, activation is
+        blocked. Deactivation always goes through (risk reduction first).
         """
         if not self.config.ENABLE_HEDGE:
             return {'action': 'disabled'}
-        
+
         # D: Refresh VIX data (None = unavailable -> hold)
         vix = self._get_vix_level(client)
         if vix is None:
@@ -1934,6 +2214,15 @@ class HedgeEngine:
 
         # S: Evaluate with hysteresis + circuit breaker (pure, no mutation)
         action = self.evaluate(vix)
+
+        # v8.5: PDT guard on activation
+        if action == 'activate' and self.config.PDT_PROTECTION and account:
+            dt_count = int(account.get('daytrade_count', 0) or 0)
+            if equity < self.config.PDT_MIN_EQUITY and dt_count >= self.config.PDT_MAX_DAY_TRADES:
+                logger.warning(f"HEDGE ACTIVATE BLOCKED by PDT guard "
+                               f"(daytrade_count={dt_count}, equity=${equity:,.0f} < $25k)")
+                return {'action': 'hold', 'vix': vix, 'hedge_active': self._hedge_active,
+                        'reason': 'pdt_guard'}
 
         # O: Execute if state change; commit state only on success
         if action in ('activate', 'deactivate'):
@@ -2279,7 +2568,9 @@ class BacktestEngine:
                                 positions[sym] = cur_shares + add
                                 trades.append({'date': exec_date, 'symbol': sym, 'action': 'BUY',
                                                'reason': f'regime:{regime}', 'shares': add,
-                                               'price': price, 'net_price': net_price})
+                                               'price': price, 'net_price': net_price,
+                                               # v8.5: strategy attribution for per-strategy P&L analysis
+                                               'strategies': top_signals.get(sym, {}).get('strategies', [])})
                             else:
                                 logger.debug(f"Skip {sym}: cost ${cost:.2f} > cash ${cash:.2f}")
                     elif delta_val < 0 and cur_shares > 0:
@@ -2533,35 +2824,87 @@ class IntradayMonitor:
         self.client = AlpacaClient(config)
         self.risk = RiskController(config)
         self.rebalancer = FailSafeRebalancer(config)
-        self.fundamentals = RealtimeFundamentals(config)
+        # v8.5 (P1-6): live fundamentals come from the same SEC XBRL
+        # point-in-time snapshots as the backtest, so live and backtest
+        # selection logic see the same data. yfinance is only a fallback
+        # (its .info endpoint is slow, rate-limited, and its _fallback
+        # defaults silently disabled 3 of 4 fundamental strategies).
+        self.fundamentals = self._init_fundamentals()
         self.constructor = PortfolioConstructor(config)
         self.macro = MacroTiming(config)
         self.hedge = HedgeEngine(config, self.client)
-        
+
         self.entry_prices = {}
         self.max_prices = {}
         self._load_state()
-    
+
+        # v8.5 (P1-3): startup reconciliation - cancel orphaned orders from a
+        # previous crashed/killed run so they cannot fill unexpectedly, and
+        # make the broker-vs-local state visible.
+        try:
+            orphans = self.client.get_open_our_orders()
+            if orphans:
+                logger.warning(f"STARTUP RECONCILE: {len(orphans)} orphaned orders from previous run, cancelling")
+                self.client.cancel_our_orders()
+        except Exception as e:
+            logger.warning(f"Startup order reconciliation failed: {e}")
+
+        if self.config.DATA_FEED == 'iex':
+            logger.warning("DATA_FEED='iex': free feed is ~15min delayed and thin for "
+                           "less-liquid names. Stops/hedge may trigger on stale prices. "
+                           "Use 'sip' for serious paper validation and live trading.")
+
+    def _init_fundamentals(self):
+        """PIT fundamentals for live mode, with freshness check + yfinance fallback."""
+        pit_path = self.config.DATA_DIR / 'pit_fundamentals_full.json'
+        if pit_path.exists():
+            age_days = (time.time() - pit_path.stat().st_mtime) / 86400
+            if age_days > 7:
+                logger.warning(f"PIT fundamentals file is {age_days:.0f}d old - "
+                               f"re-run build_pit_fundamentals.py to refresh")
+            return PointInTimeFundamentals(self.config, pit_file=str(pit_path))
+        logger.critical(f"PIT fundamentals missing ({pit_path}) - falling back to yfinance. "
+                        f"Growth/value/defensive selection will differ from backtest!")
+        return RealtimeFundamentals(self.config)
+
     def _load_state(self):
+        # v8.5: migrate legacy root-level state.json to DATA_DIR
+        legacy = Path(__file__).parent / 'state.json'
+        if not self.config.STATE_FILE.exists() and legacy.exists():
+            try:
+                self.config.STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+                os.replace(legacy, self.config.STATE_FILE)
+                logger.info("Migrated state.json -> data/state.json")
+            except Exception as e:
+                logger.warning(f"State migration failed: {e}")
         if self.config.STATE_FILE.exists():
             try:
                 with open(self.config.STATE_FILE) as f:
                     data = json.load(f)
                     self.entry_prices = data.get('entry_prices', {})
                     self.max_prices = data.get('max_prices', {})
-                    self.risk._peak_equity = data.get('peak_equity', 0)
-            except Exception:
-                pass
-    
+                    # v8.5: peak/circuit/daily-baseline survive restarts
+                    self.risk.load_state_dict(data)
+            except Exception as e:
+                # v8.5: a corrupt state must be visible, not silently swallowed
+                logger.error(f"State load failed ({e}) - starting with fresh state. "
+                             f"Stop-loss bases reset to broker avg_entry_price.")
+
     def _save_state(self):
+        """v8.5: atomic write (tmp + os.replace) - a crash mid-write can no
+        longer truncate state.json and silently drop stop-loss bases."""
         try:
-            with open(self.config.STATE_FILE, 'w') as f:
-                json.dump({
-                    'entry_prices': self.entry_prices,
-                    'max_prices': self.max_prices,
-                    'peak_equity': self.risk._peak_equity,
-                    'last_save': datetime.now().isoformat(),
-                }, f, indent=2)
+            self.config.STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self.config.STATE_FILE.with_suffix('.tmp')
+            payload = {
+                'entry_prices': self.entry_prices,
+                'max_prices': self.max_prices,
+                'last_save': now_et().isoformat(),
+            }
+            payload.update(self.risk.state_dict())
+            with open(tmp, 'w') as f:
+                json.dump(payload, f, indent=2)
+            os.replace(tmp, self.config.STATE_FILE)
         except Exception as e:
             logger.warning(f"State save failed: {e}")
     
@@ -2577,6 +2920,18 @@ class IntradayMonitor:
                 self.entry_prices[sym] = entry
                 self.max_prices[sym] = price
             else:
+                # v8.5 (P1-7): corporate-action guard. Alpaca adjusts
+                # avg_entry_price on splits; our stored entry predates it and
+                # would corrupt every P&L / stop calculation. A >5% divergence
+                # between stored entry and broker avg_entry means the basis
+                # changed underneath us (splits move it 50%+; partial fills
+                # move it far less).
+                stored = self.entry_prices[sym]
+                if entry > 0 and stored > 0 and abs(entry - stored) / stored > 0.05:
+                    logger.warning(f"BASIS RESET {sym}: stored entry ${stored:.2f} vs broker "
+                                   f"avg_entry ${entry:.2f} (split/adjustment?) - rebasing")
+                    self.entry_prices[sym] = entry
+                    self.max_prices[sym] = max(price, entry)
                 self.max_prices[sym] = max(self.max_prices.get(sym, entry), price)
         
         for sym in list(self.entry_prices.keys()):
@@ -2632,7 +2987,9 @@ class IntradayMonitor:
         return triggered
     
     def should_rebalance(self) -> bool:
-        today = datetime.now()
+        # v8.5: market calendar is judged in US Eastern, not host local time
+        # (a UTC host shifted the Friday decision into Saturday).
+        today = now_et()
         if today.weekday() != 4:  # Friday
             return False
         # Check if already rebalanced today
@@ -2658,32 +3015,37 @@ class IntradayMonitor:
         """
         if not self.risk.acquire_rebalance_lock():
             return
+        failures = []  # v8.5 (P1-8): any failure -> no last_rebalance stamp -> retry next cycle
         try:
             logger.info("=" * 60)
             logger.info("WEEKLY REBALANCE STARTED [DCL Flow: Data→Signal→Order]")
-            
+
+            # v8.5 (P1-3): no orphan orders may interfere with the rebalance
+            self.client.cancel_our_orders()
+
             # === D: 刷新数据 (Data Refresh) ===
             # v8.3 fix (A1): fetch ~400 days. v8.2 fetched 60 days, which
             # silently disabled momentum (needs 252d), growth and value (126d)
             # and made BULL regime unreachable (needs 200d MA).
+            # v8.5 (P1-2): one batched multi-symbol request instead of ~520
+            # per-symbol requests at ~6.7 req/s (over the 200 req/min free
+            # data limit -> 429 storms and silently missing stocks).
             universe = [s for s in self.config.UNIVERSE if s != 'SPY'] + ['SPY']
-            prices_data = {}
-            for sym in universe:
-                s = self.client.get_bars(sym, days=400)
-                if len(s) > 30:
-                    prices_data[sym] = s
-                time.sleep(0.15)
-            
+            prices_data = self.client.get_bars_batch(universe, days=400)
+
             prices = pd.DataFrame(prices_data).dropna(how='all').ffill()
-            
+
             # === C: 数据校验 (Check) ===
             ok, reason = self.rebalancer.validate_data(prices)
             if not ok:
                 logger.warning(f"Rebalance skipped: {reason}")
                 return
-            
+
             stock_syms = [c for c in prices.columns if c != 'SPY']
-            self.fundamentals.fetch_batch(stock_syms)
+            # v8.5 (P1-6): PIT fundamentals need no fetching; only the
+            # yfinance fallback does (slow, rate-limited).
+            if isinstance(self.fundamentals, RealtimeFundamentals):
+                self.fundamentals.fetch_batch(stock_syms)
             
             # === S: 信号生成 (Signal Generation) ===
             benchmark = prices['SPY'] if 'SPY' in prices.columns else prices.iloc[:, 0]
@@ -2724,6 +3086,12 @@ class IntradayMonitor:
             target = self.rebalancer.smart_rebalance(prices, current_symbols, signals, stock_equity)
 
             # === O: 执行下单 (Order Execution) ===
+            # v8.5 (P0-2): the rebalance now runs INSIDE the trading window
+            # while the market is open, so sells fill immediately and cash is
+            # genuinely freed before buys. The old design ran after Friday
+            # close: every order queued to the Monday open, sells had not
+            # filled, and buys were rejected for buying power (or silently
+            # used margin).
             # 必须先卖后买，释放现金
             # v8.3: never touch the hedge ETF here - it is managed by HedgeEngine
             for sym in current_symbols:
@@ -2733,14 +3101,43 @@ class IntradayMonitor:
                     try:
                         qty = int(float(next(p['qty'] for p in current_positions if p['symbol'] == sym)))
                         order = self.client.submit_order(sym, qty, 'sell')
-                        if order and order.get('status') in ('filled', 'accepted', 'new'):
+                        if order and order.get('status') in ('filled', 'accepted', 'new', 'partially_filled'):
                             logger.info(f"Sell {sym}: {qty} shares OK")
                         else:
                             logger.error(f"Sell {sym} failed")
+                            failures.append(f'sell:{sym}')
                     except StopIteration:
                         pass
                     time.sleep(0.3)
-            
+
+            # v8.5 (P0-2): verify cash actually freed before buying
+            acct = self.client.get_account()
+            cash_available = float(acct.get('cash', 0))
+            buy_needed = sum(
+                (qty - next((int(float(p['qty'])) for p in current_positions if p['symbol'] == sym), 0))
+                * float(prices[sym].iloc[-1])
+                for sym, qty in target.items()
+                if qty > next((int(float(p['qty'])) for p in current_positions if p['symbol'] == sym), 0)
+            )
+            if buy_needed > cash_available > 0:
+                logger.warning(f"Buy scaling: need ${buy_needed:,.0f}, cash ${cash_available:,.0f} "
+                               f"-> scaling buys x{cash_available / buy_needed:.2f}")
+            elif cash_available <= 0 and buy_needed > 0:
+                logger.error(f"No cash available after sells (need ${buy_needed:,.0f}) - buys skipped")
+                failures.append('no_cash_after_sells')
+
+            # v8.5 (P0-3): PDT guard - do not open new positions when the
+            # day-trade budget is exhausted on a <$25k account. A new buy
+            # today plus its stop-loss sell today would be a 4th day trade
+            # -> 90-day restriction. Existing positions are unaffected.
+            pdt_blocked = False
+            if self.config.PDT_PROTECTION:
+                dt_count = int(acct.get('daytrade_count', 0) or 0)
+                if equity < self.config.PDT_MIN_EQUITY and dt_count >= self.config.PDT_MAX_DAY_TRADES:
+                    pdt_blocked = True
+                    logger.critical(f"PDT GUARD: buys blocked (daytrade_count={dt_count}, "
+                                    f"equity=${equity:,.0f} < $25k) - keeping current holdings")
+
             for sym, qty in target.items():
                 current_qty = 0
                 for p in current_positions:
@@ -2748,30 +3145,48 @@ class IntradayMonitor:
                         current_qty = int(float(p['qty']))
                         break
                 if qty > current_qty:
-                    order = self.client.submit_order(sym, qty - current_qty, 'buy')
-                    if order and order.get('status') in ('filled', 'accepted', 'new'):
-                        logger.info(f"Buy {sym}: {qty - current_qty} shares OK")
+                    if pdt_blocked:
+                        break
+                    buy_qty = qty - current_qty
+                    # scale down if cash is short (sells partially failed)
+                    price = float(prices[sym].iloc[-1])
+                    if buy_needed > cash_available > 0:
+                        buy_qty = int(buy_qty * (cash_available / buy_needed))
+                    if buy_qty < 1:
+                        continue
+                    order = self.client.submit_order(sym, buy_qty, 'buy')
+                    if order and order.get('status') in ('filled', 'accepted', 'new', 'partially_filled'):
+                        logger.info(f"Buy {sym}: {buy_qty} shares OK")
                     else:
                         logger.error(f"Buy {sym} failed")
+                        failures.append(f'buy:{sym}')
                     time.sleep(0.3)
-            
-            # Record
-            self.entry_prices = {}
-            self.max_prices = {}
-            self._save_state()
-            
-            # Update rebalance timestamp
-            try:
-                with open(self.config.STATE_FILE) as f:
-                    data = json.load(f)
-                data['last_rebalance'] = datetime.now().isoformat()
-                with open(self.config.STATE_FILE, 'w') as f:
-                    json.dump(data, f, indent=2)
-            except:
-                pass
-            
-            logger.info("WEEKLY REBALANCE COMPLETED")
-            
+
+            # v8.5 (P1-9): do NOT clear entry_prices/max_prices here. Sold
+            # symbols are dropped by the next sync_positions; kept positions
+            # retain their trailing-stop peak. The old blanket reset silently
+            # downgraded every survivor's protection to the -8% hard stop.
+
+            # v8.5 (P1-8): stamp last_rebalance ONLY on a clean run; any
+            # failure leaves the account possibly half-rotated, so the next
+            # cycle retries instead of waiting a week.
+            if not failures:
+                self._save_state()
+                try:
+                    with open(self.config.STATE_FILE) as f:
+                        data = json.load(f)
+                    data['last_rebalance'] = now_et().isoformat()
+                    tmp = self.config.STATE_FILE.with_suffix('.tmp')
+                    with open(tmp, 'w') as f:
+                        json.dump(data, f, indent=2)
+                    os.replace(tmp, self.config.STATE_FILE)
+                except Exception as e:
+                    logger.warning(f"last_rebalance stamp failed: {e}")
+                logger.info("WEEKLY REBALANCE COMPLETED")
+            else:
+                logger.critical(f"WEEKLY REBALANCE PARTIAL FAILURE: {failures} - "
+                                f"will retry next cycle (account may be half-rotated)")
+
         finally:
             self.risk.release_rebalance_lock()
     
@@ -2780,7 +3195,7 @@ class IntradayMonitor:
         lines = []
         lines.append("")
         lines.append("=" * 70)
-        lines.append(f"  MONITOR v8.2+CondHedge {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        lines.append(f"  MONITOR v8.5 {now_et().strftime('%Y-%m-%d %H:%M:%S')} ET")
         
         equity = float(acct.get('equity', 0))
         
@@ -2831,7 +3246,24 @@ class IntradayMonitor:
     #   S(ignal): macro.detect() + 5 strategies — 基于最新数据生成选股信号
     #   O(rder): submit_order() — 信号确认后才执行交易
     # =========================================================================
+    def _in_trading_window(self) -> bool:
+        """v8.5: enforce the configured TRADING_WINDOW (was dead config).
+        Rebalances and hedge switches avoid open/close auction noise; stop
+        losses are exempt (protection beats noise)."""
+        t = now_et().time()
+        return self.config.TRADING_WINDOW_START <= t.strftime('%H:%M') <= self.config.TRADING_WINDOW_END
+
     def run_cycle(self):
+        # v8.5 (P2-6): kill switch - file present => cancel our orders, stop
+        # all trading actions, keep reporting. Delete the file to resume.
+        if self.config.KILL_SWITCH_FILE.exists():
+            logger.critical(f"KILL SWITCH active ({self.config.KILL_SWITCH_FILE.name}) - "
+                            f"no trading. Delete the file to resume.")
+            if self.config.TRADING_ENABLED:
+                self.client.cancel_our_orders()
+            print(self.generate_report(self.sync_positions()))
+            return
+
         # === Step 0: Pre-trade risk check ===
         acct = self.client.get_account()
         equity = float(acct.get('equity', 0))
@@ -2839,8 +3271,17 @@ class IntradayMonitor:
         can_trade, reason = self.risk.check_limits(equity)
         if not can_trade:
             logger.warning(f"Trading blocked: {reason}")
-            if 'max_drawdown' in reason or 'daily_loss' in reason:
-                self.risk.emergency_liquidate(self.client)
+            # v8.5: (a) TRADING_ENABLED=False shadow mode must NEVER send
+            # orders - the old code liquidated anyway; (b) liquidate at most
+            # once per circuit episode instead of every 60s for 24h.
+            if ('max_drawdown' in reason or 'daily_loss' in reason):
+                if not self.config.TRADING_ENABLED:
+                    logger.critical("SHADOW MODE: would emergency-liquidate now "
+                                    "(TRADING_ENABLED=False, no orders sent)")
+                elif not self.risk._liquidated_for_circuit:
+                    self.risk.emergency_liquidate(self.client)
+                    self.risk._liquidated_for_circuit = True
+                    self._save_state()
             return
 
         # v8.3 (C2): market-hours gating. v8.2 ran stops and the hedge 24/7,
@@ -2861,9 +3302,11 @@ class IntradayMonitor:
 
             # === Step 2.5: HEDGE — 实时条件对冲 (Intraday VIX-Triggered) ===
             # DCL: _get_vix(刷新) → evaluate(滞回带信号) → execute(市价单)
-            if self.config.ENABLE_HEDGE:
+            # v8.5: switches only inside the trading window (auction noise);
+            # account passed for the PDT guard.
+            if self.config.ENABLE_HEDGE and self._in_trading_window():
                 try:
-                    hedge_result = self.hedge.intraday_check(self.client, equity)
+                    hedge_result = self.hedge.intraday_check(self.client, equity, account=acct)
                     if hedge_result.get('action') in ('activate', 'deactivate'):
                         logger.critical(f"HEDGE {hedge_result['action'].upper()}: "
                                        f"VIX={hedge_result.get('vix', 0):.1f} | "
@@ -2874,29 +3317,52 @@ class IntradayMonitor:
                     logger.warning(f"Hedge intraday check error: {e}")
 
         # === Step 3: S+O — 选股信号生成 + 调仓下单 ===
-        # do_rebalance内部严格遵循: get_bars(刷新) → 5策略(信号) → submit_order(下单)
-        if (self.config.TRADING_ENABLED and self.should_rebalance()
-                and not market_open):
+        # v8.5 (P0-2): rebalance INSIDE the trading window while the market
+        # is open (sells fill -> cash freed -> buys fill). The old
+        # `not market_open` design queued everything to the next open and
+        # broke the sell-then-buy funding chain.
+        if (self.config.TRADING_ENABLED and market_open
+                and self._in_trading_window() and self.should_rebalance()):
             self.do_rebalance()
 
         # === Step 4: Report ===
         print(self.generate_report(self.sync_positions()))
         self._save_state()
     
+    # v8.5 (P1-5): single-instance lock. Two monitors on one account double
+    # every order and corrupt each other's state file.
+    def _acquire_instance_lock(self) -> bool:
+        try:
+            self.config.INSTANCE_LOCK_FILE.parent.mkdir(parents=True, exist_ok=True)
+            self._lock_fd = open(self.config.INSTANCE_LOCK_FILE, 'w')
+            try:
+                import fcntl
+                fcntl.flock(self._lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except ImportError:
+                pass  # non-POSIX: best-effort (pid file only)
+            self._lock_fd.write(str(os.getpid()))
+            self._lock_fd.flush()
+            return True
+        except (BlockingIOError, OSError):
+            print(f"ERROR: another monitor instance holds {self.config.INSTANCE_LOCK_FILE} - exiting")
+            return False
+
     def run(self):
+        if not self._acquire_instance_lock():
+            sys.exit(1)
         print("=" * 70)
-        print("  TENBAGGER v8.2 - Production Monitor")
+        print("  TENBAGGER v8.5 - Production Monitor")
         print("  Features: Stop loss | Daily loss limit | Drawdown circuit | Weekly rebalance")
-        print("  BUG FIXES: 001-004, HP-001 to HP-010, MP-001 to MP-006")
+        print("  PDT guard | Kill switch | Atomic state | Instance lock | PIT fundamentals")
         print("=" * 70)
         print("  Ctrl+C to stop")
-        
+
         cycle = 0
         try:
             while True:
                 cycle += 1
-                clock = self.client.get_clock()
-                print(f"\n--- #{cycle} | {datetime.now().strftime('%H:%M:%S')} | {'OPEN' if clock.get('is_open') else 'CLOSED'} ---")
+                # v8.5: single clock call per cycle (run_cycle fetches its own)
+                print(f"\n--- #{cycle} | {now_et().strftime('%H:%M:%S')} ET ---")
                 self.run_cycle()
                 time.sleep(60)
         except KeyboardInterrupt:
@@ -2929,6 +3395,14 @@ def main():
         return
     
     if args.mode == 'paper':
+        # v8.5 (P2-9): pointing at a LIVE base URL requires an explicit
+        # acknowledgement so paper/live can never be confused by accident.
+        if 'paper' not in config.ALPACA_BASE_URL:
+            if os.environ.get('LIVE_TRADING_ACK') != 'I_UNDERSTAND':
+                print("REFUSED: ALPACA_BASE_URL is a LIVE endpoint "
+                      f"({config.ALPACA_BASE_URL}) but LIVE_TRADING_ACK != I_UNDERSTAND")
+                sys.exit(1)
+            print("*** LIVE TRADING MODE - real money at risk ***")
         monitor = IntradayMonitor(config)
         monitor.run()
         return

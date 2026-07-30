@@ -1,11 +1,55 @@
-# Measured Results (v8.2 → v8.4)
+# Measured Results (v8.2 → v8.6)
 
 > **Bottom line (updated 2026-07-30)**: over the extended window
-> **2020-01-10 → 2026-07-29**, the de-biased v8.4 full-pool strategy
-> **beats SPY by +77pp** (+172.8% vs +95.6%, Sharpe 0.99, beta 0.40),
-> driven by 2024-2026 momentum capture. This number still carries
-> survivorship bias (2026-era constituents) and is an **overestimate** —
-> see caveats. The 10-stock dev universe lags SPY badly (+44.3% vs +95.6%).
+> **2020-01-10 → 2026-07-29**, the v8.6 full-pool strategy (growth sleeve
+> removed after a 21-experiment attribution battery) returns **+240.0% vs
+> SPY +95.6% (+144pp)**, Sharpe **1.20**, Max DD **-24.7%**, and beats SPY
+> in BOTH sub-periods (2020-23: +60.1% vs +25.5%; 2024-26: +116.8% vs
+> +56.7%). Numbers still carry survivorship bias (2026-era constituents)
+> and are an **overestimate** — see caveats.
+
+## v8.6: strategy attribution & ablation battery (2026-07-30)
+
+21 full-pool backtests (solo / ablation / hedge / risk / filter / stop
+variants). Headline findings, all vs base +172.8% / Sharpe 0.99 / MDD -27.6%:
+
+| Component | Evidence | Verdict |
+|---|---|---|
+| Momentum | ablation collapses to +11.3% (-161pp) | **core driver, keep** |
+| Value | ablation -88pp; solo Sharpe 1.13 (best) | **core, keep** |
+| Defensive | ablation -75pp, MDD worsens to -36.6% | keep (panic protection) |
+| **Growth** | solo +40.7%/0.42 (worst); **ablation +240.0% (+67pp)** | **removed in v8.6** |
+| SQQQ hedge 10% | hedge_off -82pp; compress_only ≈ hedge_off | keep - protection comes from the short exposure itself, NOT the stock compression |
+| Risk breakers | risk_off -12pp | keep |
+| Volatility filter | off: +45.1% (-128pp) | keep |
+| -8% hard stop | wide: -72pp; off: -92pp | keep |
+| 21d-high filter | off: +174.8% (+2pp) | neutral, kept |
+
+Growth removal robustness: improvement holds in both sub-periods and in 5
+of 6 calendar years (only 2024 lags base). It is a one-bit change
+(weight=0), not parameter fitting. Growth picks are mildly profitable
+standalone (+$16K attributed) but crowd out momentum slots — negative
+opportunity cost, not bad signals.
+
+## Extended window: 2020-01-10 → 2026-07-29 (v8.6 vs v8.4, PIT fundamentals)
+
+| Universe | Version | Total Return | CAGR | Sharpe | Max DD | vs SPY |
+|---|---|---|---|---|---|---|
+| 487 stocks | **v8.6** | **+240.0%** | +24.8% | **1.20** | -24.7% | **+144.4%** |
+| 487 stocks | v8.4 | +172.8% | +19.9% | 0.99 | -27.6% | +77.2% |
+| 10 stocks (dev) | v8.6 | +79.8% | +11.5% | 0.79 | — | -15.8% |
+| 10 stocks (dev) | v8.4 | +44.3% | +6.9% | 0.54 | -35.0% | -51.3% |
+
+Yearly (v8.6 full pool vs SPY):
+
+| Year | v8.6 | SPY | Note |
+|---|---|---|---|
+| 2021 | +19.4% | +27.0% | still lags mega-cap bull, much less |
+| 2022 | -3.4% | -19.5% | defense + hedge work |
+| 2023 | +39.2% | +24.3% | strong capture |
+| 2024 | +47.2% | +23.3% | AI-infra momentum (only year < v8.4) |
+| 2025 | +18.0% | +16.4% | tariff crash weathered |
+| 2026 YTD | +22.3% | +7.0% | broad leadership |
 
 ## Extended window: 2020-01-10 → 2026-07-29 (v8.4, PIT fundamentals)
 

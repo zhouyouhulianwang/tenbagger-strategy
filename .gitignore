@@ -1,5 +1,10 @@
 logs/
 __pycache__/
 state.json
+data/state.json
+data/.keys
+data/.tenbagger.lock
+data/fundamentals_v82.json
 *.png
 data/pit/
+STOP_TRADING

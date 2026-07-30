@@ -1,13 +1,26 @@
-# Tenbagger Strategy v8.4
+# Tenbagger Strategy v8.6
 
 > **Status**: Active on Alpaca Paper Trading (Account: paper trading 2) for simulation and validation.
 >
-> **Measured results (read first)**: with point-in-time fundamentals and de-biased
-> scoring, the full-pool strategy beat SPY over 2020-01 → 2026-07 (+172.8% vs
-> +95.6%) but lagged over the 2020-2023 sub-window; all figures carry
-> survivorship bias (2026-era constituents). Earlier headline numbers were
-> inflated by look-ahead data. See [RESULTS.md](RESULTS.md) for the full
-> comparison and methodology before trusting any backtest figure in this repo.
+> **Measured results (read first)**: after a 21-experiment attribution and
+> ablation battery, the growth sleeve was removed (it was a net drag: solo
+> Sharpe 0.42, ablation +67pp). The resulting v8.6 full-pool strategy
+> returns **+240.0% vs SPY +95.6%** over 2020-01 → 2026-07 (Sharpe 1.20,
+> Max DD -24.7%), beating SPY in both sub-periods; all figures carry
+> survivorship bias (2026-era constituents). See [RESULTS.md](RESULTS.md)
+> for the full comparison and methodology before trusting any backtest
+> figure in this repo.
+>
+> **v8.5 (paper/live readiness)**: full Alpaca-operations review found and fixed
+> 4 release-blocking defects — the weekly rebalance crashed on a timezone type
+> error (so paper holdings had silently diverged from the strategy), after-close
+> rebalancing queued sells+buys into the same next open (buys rejected or on
+> margin), there was no Pattern-Day-Trader protection, and fractional SQQQ
+> residue desynced the hedge state machine. Also added: in-window rebalancing
+> with verified cash chaining, batched market-data pulls, PIT fundamentals in
+> live mode, atomic state + instance lock + kill switch, split-safe cost basis,
+> and US-Eastern market-time handling throughout. See the v8.5 section in the
+> module docstring for the complete list.
 
 Multi-factor quantitative trading system with real-time conditional hedge, 520-stock universe (S&P 500 + NASDAQ 100), and six-layer risk defense.
 
