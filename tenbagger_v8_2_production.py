@@ -311,6 +311,12 @@ class Config:
     DEFENSIVE_MAX_VOLATILITY: float = 0.25
     DEFENSIVE_MIN_DIV_YIELD: float = 0.015
     
+    # v8.9 (data-driven, approved 2026-07-31): regime position factor removed.
+    # Forcing pf=1.0 beat every de-grossing variant: +559.6%/Sharpe 1.59/
+    # MDD -22.8% vs v8.8 +335.7%/1.34/-23.0%, and won ALL six calendar years
+    # incl. 2022 (+3.8% vs -2.6%). Real risk control lives in stock selection
+    # (vol gate, RS filter, defensive sleeve) + stops, not blunt exposure cuts.
+    REGIME_DEGROSS_ENABLED: bool = False
     # === Strategy Weights by Regime ===
     # v8.6 (data-driven): growth weight zeroed in every regime. Evidence
     # (full-pool 2020-01 -> 2026-07, 21-experiment attribution/ablation
@@ -1423,7 +1429,8 @@ class MacroTiming:
         
         # HP-006 FIX: Defensive check - need at least 60 days for meaningful detection
         if t < 60 or len(spy) < 60:
-            return 'NEUTRAL', {'position_factor': 0.85, 'hedge_ratio': 0.05, 'reason': 'insufficient_data'}
+            return 'NEUTRAL', {'position_factor': 0.85 if self.config.REGIME_DEGROSS_ENABLED else 1.0,
+                               'hedge_ratio': 0.05, 'reason': 'insufficient_data'}
         
         recent_ret = spy.pct_change().dropna().iloc[-20:]
         current_vol = recent_ret.std() * np.sqrt(252)
@@ -1468,8 +1475,13 @@ class MacroTiming:
                 older_vol = older_vol_data.std() * np.sqrt(252)
                 vol_trend = current_vol - older_vol
                 if vol_trend > 0.05:
-                    pf *= 0.80
+                    if self.config.REGIME_DEGROSS_ENABLED:
+                        pf *= 0.80
                     hr = min(hr + 0.10, 0.30)
+
+        # v8.9: regime no longer scales exposure (see Config note)
+        if not self.config.REGIME_DEGROSS_ENABLED:
+            pf = 1.0
         
         return regime, {
             'regime': regime, 'position_factor': max(pf, 0.20),
