@@ -245,6 +245,14 @@ class Config:
     HARD_STOP_LOSS_PCT: float = -0.08
     TRAILING_STOP_50_PCT: float = -0.20   # After +50% gain
     TRAILING_STOP_100_PCT: float = -0.25  # After +100% gain
+    # === Alternative risk framework (config-gated, defaults preserve current behavior) ===
+    STOP_MODE: str = 'tiered'             # 'tiered' (current) | 'trail21' (21d-high -15%)
+    TRAIL21_STOP_PCT: float = -0.15       # exit when close < 21d high * (1 + pct)
+    VIX_HALVE_ENABLED: bool = False       # prev-day VIX >= threshold -> halve stock exposure
+    VIX_HALVE_THRESHOLD: float = 30.0
+    RV90_BUY_BLOCK_ENABLED: bool = False  # block NEW buys when 21d ann. vol > RV90_MAX_VOL
+    RV90_MAX_VOL: float = 0.90
+    BREADTH_SCALING_ENABLED: bool = False # pos_factor *= fraction of universe with r252 > 0
     
     # === Portfolio Risk ===
     DAILY_LOSS_LIMIT_PCT: float = -0.03     # Stop trading if down 3% today
@@ -269,7 +277,13 @@ class Config:
     # 研究结论: 永久对冲年耗9%无效; 条件对冲(VIX>=25)夏普2.56显著有效
     # 回测数据: SQQQ 10%仅VIX>=25 → 年化61.8%(仅-2.1%), DD -23.2%, 2022熊市+29.8%
     # 窄滞回: VIX>=25建仓 | VIX<=24.75清仓 | 24.75<VIX<25保持 | 日切换>2次熔断
-    ENABLE_HEDGE: bool = True                # Master switch
+    # v8.8 (data-driven, approved 2026-07-30): SQQQ hedge disabled. After the
+    # v8.6 growth removal + v8.7 200d regime gating, the regime position factor
+    # already de-grosses in downturns and the hedge's marginal value vanished:
+    # no_sqqq +335.7%/Sharpe 1.34/MDD -23.0% vs hedged +326.9%/1.34/-23.2%
+    # (data/hedge_framework_experiments.json). VIX-halve/trail21/RV90/breadth
+    # layers were also tested and all hurt - NOT adopted.
+    ENABLE_HEDGE: bool = False               # Master switch
     HEDGE_VIX_ACTIVATE: float = 25.0         # VIX >= 25.0: 实时建仓SQQQ
     HEDGE_VIX_DEACTIVATE: float = 24.75      # VIX <= 24.75: 实时清仓SQQQ (窄滞回)
     HEDGE_POSITION_PCT: float = 0.10         # 对冲仓位=10% portfolio (VIX>=25时)
@@ -2299,13 +2313,14 @@ class BacktestEngine:
 
         # v8.3: align VIX to the trading calendar
         vix_aligned = None
-        if vix is not None and self.config.ENABLE_HEDGE:
+        if vix is not None and (self.config.ENABLE_HEDGE or self.config.VIX_HALVE_ENABLED):
             vix_aligned = vix.reindex(prices.index, method='ffill')
 
         cash = self.config.INITIAL_CAPITAL
         positions = {}      # {sym: shares} - stocks only
         hedge_shares = 0    # SQQQ shares (managed by hedge engine, not stops)
         hedge_entry = 0.0
+        degrossed = False   # VIX-halve overlay state (alternative framework)
         portfolio_values = []
         trades = []
         daily_rets = []
@@ -2343,9 +2358,17 @@ class BacktestEngine:
                     
                     stop_triggered = False
                     reason = ''
-                    
+
+                    if self.config.STOP_MODE == 'trail21':
+                        # Alternative framework: trailing stop off the 21-day
+                        # closing high (chandelier-style), replaces tiered stops
+                        if t >= 20:
+                            high_21 = prices[sym].iloc[max(0, t-20):t+1].max()
+                            if price <= high_21 * (1 + self.config.TRAIL21_STOP_PCT):
+                                stop_triggered = True
+                                reason = 'trail21_high'
                     # BUG-002 FIX: Use independent ifs (not elif), check highest threshold first
-                    if pnl_pct <= self.config.HARD_STOP_LOSS_PCT:
+                    elif pnl_pct <= self.config.HARD_STOP_LOSS_PCT:
                         stop_triggered = True
                         reason = 'hard_stop'
                     # trailing_100 check FIRST (higher threshold takes priority)
@@ -2427,7 +2450,7 @@ class BacktestEngine:
                 continue
 
             # 2.6 v8.3: conditional hedge (same hysteresis rules as live)
-            if vix_aligned is not None:
+            if vix_aligned is not None and self.config.ENABLE_HEDGE:
                 v = vix_aligned.iloc[t]
                 if not np.isnan(v) and hedge_px > 0:
                     h_action = hedge.evaluate(float(v), now=current_date)
@@ -2456,6 +2479,34 @@ class BacktestEngine:
                         hedge_shares = 0
                         hedge._commit_switch('deactivate')
 
+            # 2.7 Alternative framework: prev-day VIX >= 30 -> halve stock
+            # exposure (pro-rata); VIX back below -> force rebalance to restore.
+            if self.config.VIX_HALVE_ENABLED and vix_aligned is not None and t >= 1:
+                v_prev = vix_aligned.iloc[t - 1]
+                if not np.isnan(v_prev):
+                    if v_prev >= self.config.VIX_HALVE_THRESHOLD and not degrossed:
+                        for sym, shares in list(positions.items()):
+                            sell_q = int(shares * 0.5)
+                            if sell_q > 0 and sym in current_prices and current_prices[sym] > 0:
+                                price = current_prices[sym]
+                                _fa = fundamentals.get_asof(sym, current_date, price)
+                                mkt_cap = _fa.get('market_cap', 0) or 50e9
+                                net_price = txn.apply_to_backtest(price, sell_q, is_buy=False,
+                                                                  market_cap=mkt_cap, config=self.config)
+                                cash += sell_q * net_price
+                                entry = entry_prices.get(sym, net_price)
+                                trades.append({'date': current_date, 'symbol': sym, 'action': 'SELL',
+                                               'reason': f'vix_halve_{v_prev:.1f}', 'shares': sell_q,
+                                               'price': price, 'net_price': net_price,
+                                               'pnl_pct': (net_price - entry) / entry if entry > 0 else 0})
+                                positions[sym] = shares - sell_q
+                                if positions[sym] <= 0:
+                                    positions.pop(sym); entry_prices.pop(sym, None)
+                                    max_prices_tracker.pop(sym, None)
+                        degrossed = True
+                    elif v_prev < self.config.VIX_HALVE_THRESHOLD and degrossed:
+                        degrossed = False
+                        self._last_t = t - self.config.REBALANCE_DAYS  # force re-entry at next step
 
             # 3. Rebalance check (v8.3: delta-based - keeps overlapping holdings,
             #    only trades the difference. v8.2 liquidated everything weekly,
@@ -2468,6 +2519,19 @@ class BacktestEngine:
                 regime, macro_signal = macro.detect(prices, t)
                 weights = macro.get_weights(regime, self.config)
                 pos_factor = macro_signal.get('position_factor', 1.0)
+
+                # Alternative framework: breadth scaling - pos_factor shrinks
+                # with the fraction of universe stocks above their 252d ago price
+                if self.config.BREADTH_SCALING_ENABLED:
+                    _ok, _tot = 0, 0
+                    for _c in sel_prices.columns:
+                        _col = sel_prices[_c].iloc[:t+1].dropna()
+                        if len(_col) > 252:
+                            _tot += 1
+                            if _col.iloc[-1] > _col.iloc[-253]:
+                                _ok += 1
+                    breadth = _ok / _tot if _tot else 1.0
+                    pos_factor *= breadth
 
                 # 4 strategies select (v8.3: SPY/SQQQ excluded from candidates)
                 mom_picks = mom_strat.select(sel_prices, benchmark, t)
@@ -2508,6 +2572,12 @@ class BacktestEngine:
                         vol = prices[sym].iloc[max(0, t-20):t+1].pct_change().std() * np.sqrt(252)
                     else:
                         vol = 0.30
+                    # Alternative framework: RV90 blocks NEW buys only
+                    # (existing holdings may stay in targets)
+                    if (self.config.RV90_BUY_BLOCK_ENABLED
+                            and vol > self.config.RV90_MAX_VOL
+                            and positions.get(sym, 0) <= 0):
+                        continue
                     if 'defensive' in signal.get('strategies', []):
                         vol *= 0.8
                     vol_factor = min(self.config.VOLATILITY_TARGET / vol, 2.0) if vol > 0 else 1.0
