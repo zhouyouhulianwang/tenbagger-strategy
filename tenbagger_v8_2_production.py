@@ -3128,7 +3128,7 @@ class IntradayMonitor:
                 else:
                     logger.error(f"Stop sell {sym} failed: {order}")
                     self.notifier.send(f"❌ 止损卖单失败: {sym} - 请人工检查！",
-                                       key=f'stop_fail_{sym}', min_interval=0)
+                                       key=f'stop_fail_{sym}', min_interval=300)
         return triggered
     
     def should_rebalance(self) -> bool:
@@ -3164,7 +3164,10 @@ class IntradayMonitor:
         try:
             logger.info("=" * 60)
             logger.info("WEEKLY REBALANCE STARTED [DCL Flow: Data→Signal→Order]")
-            self.notifier.send("🔄 周度调仓开始", key='rebalance_start', min_interval=0)
+            # v9.1: rate-limit 4h (once per rebalance window) - the rebalance
+            # re-runs every cycle inside the Friday window (mostly no-op
+            # drift checks); min_interval=0 spammed Telegram every minute
+            self.notifier.send("🔄 周度调仓开始", key='rebalance_start', min_interval=14400)
 
             # v8.5 (P1-3): no orphan orders may interfere with the rebalance
             self.client.cancel_our_orders()
@@ -3352,12 +3355,12 @@ class IntradayMonitor:
                 tgt = ', '.join(f'{s}' for s in target.keys())
                 self.notifier.send(
                     f"✅ 周度调仓完成 | regime={regime} | 目标: {tgt} | equity ${equity:,.0f}",
-                    key='rebalance_done', min_interval=0)
+                    key='rebalance_done', min_interval=14400)
             else:
                 logger.critical(f"WEEKLY REBALANCE PARTIAL FAILURE: {failures} - "
                                 f"will retry next cycle (account may be half-rotated)")
                 self.notifier.send(f"❌ 周度调仓部分失败: {failures} - 下周期自动重试",
-                                   key='rebalance_fail', min_interval=0)
+                                   key='rebalance_fail', min_interval=900)
 
         finally:
             self.risk.release_rebalance_lock()
