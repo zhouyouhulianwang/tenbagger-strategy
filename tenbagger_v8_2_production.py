@@ -2928,6 +2928,9 @@ class Notifier:
     def send(self, text: str, key: str = None, min_interval: int = 300):
         if not self.enabled:
             return
+        # User standing instruction (2026-07-31): every Telegram notification
+        # from this system carries the [AL 2] account tag
+        text = f"[AL 2] {text}"
         k = key or text[:40]
         now = time.time()
         if now - self._last_sent.get(k, 0) < min_interval:
