@@ -246,6 +246,12 @@ class Config:
     TRAILING_STOP_50_PCT: float = -0.20   # After +50% gain
     TRAILING_STOP_100_PCT: float = -0.25  # After +100% gain
     # === Alternative risk framework (config-gated, defaults preserve current behavior) ===
+    # WARNING: these four are implemented in BacktestEngine ONLY (tested and
+    # REJECTED 2026-07-31). The live monitor ignores them - enabling them
+    # here has NO live effect.
+    # === Telegram notifications (v9.0): both env vars required to enable ===
+    TELEGRAM_BOT_TOKEN: str = field(default_factory=lambda: os.environ.get('TELEGRAM_BOT_TOKEN', ''))
+    TELEGRAM_CHAT_ID: str = field(default_factory=lambda: os.environ.get('TELEGRAM_CHAT_ID', ''))
     STOP_MODE: str = 'tiered'             # 'tiered' (current) | 'trail21' (21d-high -15%)
     TRAIL21_STOP_PCT: float = -0.15       # exit when close < 21d high * (1 + pct)
     VIX_HALVE_ENABLED: bool = False       # prev-day VIX >= threshold -> halve stock exposure
@@ -693,9 +699,12 @@ class AlpacaClient:
         r = self._request('GET', f"{self.config.ALPACA_BASE_URL}/v2/account")
         return r.json() if r.status_code == 200 else {}
     
-    def get_positions(self) -> List[Dict]:
+    def get_positions(self) -> Optional[List[Dict]]:
+        """v9.0 (audit P1): None = read failed, [] = genuinely flat. Callers
+        must distinguish - treating a failed read as 'flat' wiped stop-loss
+        state and fed false liquidation signals."""
         r = self._request('GET', f"{self.config.ALPACA_BASE_URL}/v2/positions")
-        return r.json() if r.status_code == 200 else []
+        return r.json() if r.status_code == 200 else None
     
     def get_clock(self) -> Dict:
         r = self._request('GET', f"{self.config.ALPACA_BASE_URL}/v2/clock")
@@ -1690,6 +1699,10 @@ class RiskController:
         """Sell all positions immediately. Returns summary of results."""
         logger.critical("EMERGENCY LIQUIDATION INITIATED")
         positions = client.get_positions()
+        if positions is None:
+            # v9.0: cannot even read positions - do not pretend we liquidated
+            logger.critical("EMERGENCY LIQUIDATION ABORTED: positions unreadable (API error)")
+            return {'succeeded': [], 'failed': ['positions_read_failed']}
         results = {'succeeded': [], 'failed': []}
         
         for p in positions:
@@ -2903,9 +2916,38 @@ class WalkForwardValidator:
 # INTRADAY MONITOR (BUG-002 FIX, HP-004 FIX, MP-003 FIX)
 # ============================================================================
 
+class Notifier:
+    """v9.0: Telegram push notifications. Fire-and-forget: never raises,
+    rate-limits per key so a flapping condition can't spam the chat."""
+
+    def __init__(self, config: Config = None):
+        self.config = config or Config()
+        self.enabled = bool(self.config.TELEGRAM_BOT_TOKEN and self.config.TELEGRAM_CHAT_ID)
+        self._last_sent = {}
+
+    def send(self, text: str, key: str = None, min_interval: int = 300):
+        if not self.enabled:
+            return
+        k = key or text[:40]
+        now = time.time()
+        if now - self._last_sent.get(k, 0) < min_interval:
+            return
+        try:
+            r = requests.post(
+                f"https://api.telegram.org/bot{self.config.TELEGRAM_BOT_TOKEN}/sendMessage",
+                json={'chat_id': self.config.TELEGRAM_CHAT_ID, 'text': text},
+                timeout=10)
+            if r.status_code == 200:
+                self._last_sent[k] = now
+            else:
+                logger.warning(f"telegram send HTTP {r.status_code}: {r.text[:120]}")
+        except Exception as e:
+            logger.warning(f"telegram send failed: {e}")
+
+
 class IntradayMonitor:
     """Production intraday monitor with full risk control and weekly rebalance."""
-    
+
     def __init__(self, config: Config = None):
         self.config = config or Config()
         self.client = AlpacaClient(config)
@@ -2923,6 +2965,9 @@ class IntradayMonitor:
 
         self.entry_prices = {}
         self.max_prices = {}
+        self.notifier = Notifier(self.config)
+        self._last_positions = []      # v9.0: last known-good broker positions
+        self._consecutive_errors = 0   # v9.0: cycle exception streak
         self._load_state()
 
         # v8.5 (P1-3): startup reconciliation - cancel orphaned orders from a
@@ -2997,6 +3042,12 @@ class IntradayMonitor:
     
     def sync_positions(self):
         positions = self.client.get_positions()
+        # v9.0 (audit P1): a failed read is NOT an empty account. Keep the
+        # last known-good snapshot and leave stop-loss state untouched.
+        if positions is None:
+            logger.warning("positions read failed - keeping last known state (no state mutation)")
+            return self._last_positions
+        self._last_positions = positions
         current = set()
         for p in positions:
             sym = p['symbol']
@@ -3036,7 +3087,7 @@ class IntradayMonitor:
             sym = p['symbol']
             if sym == self.config.HEDGE_ETF:
                 continue  # v8.3: hedge position is managed by HedgeEngine, not stock stops
-            qty = int(float(p['qty']))
+            qty = float(p['qty'])  # v9.0: exact qty incl. fractional
             entry = self.entry_prices.get(sym, float(p['avg_entry_price']))
             current = float(p['current_price'])
             max_p = self.max_prices.get(sym, entry)
@@ -3066,11 +3117,15 @@ class IntradayMonitor:
             
             if stop:
                 logger.warning(f"STOP: {sym} P&L={pnl_pct:.1%} {reason}")
+                self.notifier.send(f"📉 止损触发: {sym} P&L {pnl_pct:+.1%} ({reason})，卖出 {qty} 股",
+                                   key=f'stop_{sym}', min_interval=0)
                 order = self.client.submit_order(sym, qty, 'sell')
                 if order and order.get('status') in ('filled', 'accepted', 'new'):
                     triggered += 1
                 else:
                     logger.error(f"Stop sell {sym} failed: {order}")
+                    self.notifier.send(f"❌ 止损卖单失败: {sym} - 请人工检查！",
+                                       key=f'stop_fail_{sym}', min_interval=0)
         return triggered
     
     def should_rebalance(self) -> bool:
@@ -3106,6 +3161,7 @@ class IntradayMonitor:
         try:
             logger.info("=" * 60)
             logger.info("WEEKLY REBALANCE STARTED [DCL Flow: Data→Signal→Order]")
+            self.notifier.send("🔄 周度调仓开始", key='rebalance_start', min_interval=0)
 
             # v8.5 (P1-3): no orphan orders may interfere with the rebalance
             self.client.cancel_our_orders()
@@ -3161,8 +3217,14 @@ class IntradayMonitor:
             
             # 确定目标持仓 (stock compression由盘中hedge引擎管理)
             acct = self.client.get_account()
-            equity = float(acct.get('equity', 100000))
             current_positions = self.client.get_positions()
+            # v9.0 (audit P0/P1): unreadable account/positions -> abort the
+            # rebalance entirely (no stamp -> retry next cycle)
+            if not acct or float(acct.get('equity', 0) or 0) <= 0 or current_positions is None:
+                logger.critical("Rebalance aborted: account/positions unreadable")
+                failures.append('account_read')
+                return
+            equity = float(acct['equity'])
             current_symbols = {p['symbol'] for p in current_positions}
             
             # Stock equity: hedge compression + regime position factor
@@ -3186,7 +3248,9 @@ class IntradayMonitor:
                     continue
                 if sym not in target:
                     try:
-                        qty = int(float(next(p['qty'] for p in current_positions if p['symbol'] == sym)))
+                        # v9.0 (audit P2): exact qty incl. fractional - int()
+                        # truncation used to leave fractional residue behind
+                        qty = float(next(p['qty'] for p in current_positions if p['symbol'] == sym))
                         order = self.client.submit_order(sym, qty, 'sell')
                         if order and order.get('status') in ('filled', 'accepted', 'new', 'partially_filled'):
                             logger.info(f"Sell {sym}: {qty} shares OK")
@@ -3197,15 +3261,24 @@ class IntradayMonitor:
                         pass
                     time.sleep(0.3)
 
-            # v8.5 (P0-2): verify cash actually freed before buying
-            acct = self.client.get_account()
-            cash_available = float(acct.get('cash', 0))
             buy_needed = sum(
                 (qty - next((int(float(p['qty'])) for p in current_positions if p['symbol'] == sym), 0))
                 * float(prices[sym].iloc[-1])
                 for sym, qty in target.items()
                 if qty > next((int(float(p['qty'])) for p in current_positions if p['symbol'] == sym), 0)
             )
+            # v9.0 (audit P1): sell orders can still be queued after the 30s
+            # fill poll ('accepted'/'new'). Poll the cash balance until the
+            # proceeds actually settle (same 12x5s loop as initial_sync.py)
+            # instead of reading it exactly once.
+            cash_available = 0.0
+            for _ in range(12):
+                acct2 = self.client.get_account()
+                if acct2:
+                    cash_available = float(acct2.get('cash', 0) or 0)
+                if buy_needed <= 0 or cash_available >= buy_needed * 0.98:
+                    break
+                time.sleep(5)
             if buy_needed > cash_available > 0:
                 logger.warning(f"Buy scaling: need ${buy_needed:,.0f}, cash ${cash_available:,.0f} "
                                f"-> scaling buys x{cash_available / buy_needed:.2f}")
@@ -3222,6 +3295,9 @@ class IntradayMonitor:
                 dt_count = int(acct.get('daytrade_count', 0) or 0)
                 if equity < self.config.PDT_MIN_EQUITY and dt_count >= self.config.PDT_MAX_DAY_TRADES:
                     pdt_blocked = True
+                    # v9.0 (audit P2): blocked buys = incomplete rotation ->
+                    # no last_rebalance stamp, retry next cycle
+                    failures.append('pdt_blocked')
                     logger.critical(f"PDT GUARD: buys blocked (daytrade_count={dt_count}, "
                                     f"equity=${equity:,.0f} < $25k) - keeping current holdings")
 
@@ -3270,9 +3346,15 @@ class IntradayMonitor:
                 except Exception as e:
                     logger.warning(f"last_rebalance stamp failed: {e}")
                 logger.info("WEEKLY REBALANCE COMPLETED")
+                tgt = ', '.join(f'{s}' for s in target.keys())
+                self.notifier.send(
+                    f"✅ 周度调仓完成 | regime={regime} | 目标: {tgt} | equity ${equity:,.0f}",
+                    key='rebalance_done', min_interval=0)
             else:
                 logger.critical(f"WEEKLY REBALANCE PARTIAL FAILURE: {failures} - "
                                 f"will retry next cycle (account may be half-rotated)")
+                self.notifier.send(f"❌ 周度调仓部分失败: {failures} - 下周期自动重试",
+                                   key='rebalance_fail', min_interval=0)
 
         finally:
             self.risk.release_rebalance_lock()
@@ -3346,6 +3428,8 @@ class IntradayMonitor:
         if self.config.KILL_SWITCH_FILE.exists():
             logger.critical(f"KILL SWITCH active ({self.config.KILL_SWITCH_FILE.name}) - "
                             f"no trading. Delete the file to resume.")
+            self.notifier.send("🛑 KILL SWITCH 生效中：已撤销挂单，停止一切交易动作",
+                               key='kill_switch', min_interval=3600)
             if self.config.TRADING_ENABLED:
                 self.client.cancel_our_orders()
             print(self.generate_report(self.sync_positions()))
@@ -3353,7 +3437,16 @@ class IntradayMonitor:
 
         # === Step 0: Pre-trade risk check ===
         acct = self.client.get_account()
-        equity = float(acct.get('equity', 0))
+        # v9.0 (audit P0): a failed account read must fail-safe toward HOLD,
+        # never toward liquidation. equity=0 reads as -100% daily loss AND
+        # -100% drawdown -> full emergency liquidation on a transient API
+        # error. Skip the cycle instead.
+        if not acct or float(acct.get('equity', 0) or 0) <= 0:
+            logger.warning("account read failed or zero equity - cycle skipped (HOLD, no risk actions)")
+            self.notifier.send("⚠️ Alpaca 账户读取失败，本周期跳过（HOLD，不触发风控动作）",
+                               key='acct_read_fail', min_interval=900)
+            return
+        equity = float(acct['equity'])
 
         can_trade, reason = self.risk.check_limits(equity)
         if not can_trade:
@@ -3366,9 +3459,14 @@ class IntradayMonitor:
                     logger.critical("SHADOW MODE: would emergency-liquidate now "
                                     "(TRADING_ENABLED=False, no orders sent)")
                 elif not self.risk._liquidated_for_circuit:
-                    self.risk.emergency_liquidate(self.client)
+                    self.notifier.send(f"🚨 风控触发 {reason}，执行紧急清仓 (equity ${equity:,.0f})",
+                                       key='liquidate', min_interval=0)
+                    result = self.risk.emergency_liquidate(self.client)
                     self.risk._liquidated_for_circuit = True
                     self._save_state()
+                    self.notifier.send(f"🚨 清仓结果: 成功 {len(result.get('succeeded', []))} 只, "
+                                       f"失败 {result.get('failed', [])}",
+                                       key='liquidate_result', min_interval=0)
             return
 
         # v8.3 (C2): market-hours gating. v8.2 ran stops and the hedge 24/7,
@@ -3444,13 +3542,29 @@ class IntradayMonitor:
         print("=" * 70)
         print("  Ctrl+C to stop")
 
+        mode = 'LIVE' if 'paper' not in self.config.ALPACA_BASE_URL else 'paper'
+        self.notifier.send(f"🚀 Tenbagger monitor 已启动 ({mode}, v9.0) | "
+                           f"止损/日亏/回撤熔断/周五调仓 | Telegram 通知已开启",
+                           key='startup', min_interval=0)
         cycle = 0
         try:
             while True:
                 cycle += 1
                 # v8.5: single clock call per cycle (run_cycle fetches its own)
                 print(f"\n--- #{cycle} | {now_et().strftime('%H:%M:%S')} ET ---")
-                self.run_cycle()
+                # v9.0 (audit P1): a cycle exception must not kill the loop.
+                # systemd restart is the last resort, not the error handler.
+                try:
+                    self.run_cycle()
+                    self._consecutive_errors = 0
+                except Exception as e:
+                    self._consecutive_errors += 1
+                    logger.exception(f"cycle {cycle} raised: {e}")
+                    if self._consecutive_errors in (1, 5, 15, 60):
+                        self.notifier.send(
+                            f"❌ monitor 周期异常 x{self._consecutive_errors}: "
+                            f"{type(e).__name__}: {str(e)[:200]}",
+                            key='cycle_error', min_interval=0)
                 time.sleep(60)
         except KeyboardInterrupt:
             print("\nStopped")
