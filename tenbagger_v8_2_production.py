@@ -252,7 +252,7 @@ class Config:
     # === Telegram notifications (v9.0): both env vars required to enable ===
     TELEGRAM_BOT_TOKEN: str = field(default_factory=lambda: os.environ.get('TELEGRAM_BOT_TOKEN', ''))
     TELEGRAM_CHAT_ID: str = field(default_factory=lambda: os.environ.get('TELEGRAM_CHAT_ID', ''))
-    STOP_MODE: str = 'tiered'             # 'tiered' (current) | 'trail21' (21d-high -15%)
+    STOP_MODE: str = 'tiered'             # 'tiered' (current) | 'trail21' (21d-high -15%) | 'off' (ablation only)
     TRAIL21_STOP_PCT: float = -0.15       # exit when close < 21d high * (1 + pct)
     VIX_HALVE_ENABLED: bool = False       # prev-day VIX >= threshold -> halve stock exposure
     VIX_HALVE_THRESHOLD: float = 30.0
@@ -272,6 +272,13 @@ class Config:
     STALL_LOOKBACK: int = 21
 
     # === Portfolio Risk ===
+    # Ablation scores 2026-07-31 (v8.9 base 559.6/1.59/-22.8, full pool):
+    #   remove daily limit  -> 269.2/1.12/-30.4  (value: +290pp, TOP defender)
+    #   remove stops        -> 385.6/1.36/-26.1  (value: +174pp; hard -8% did
+    #                          all the work, trailing 50/100 fired ZERO times
+    #                          in 6y - dead code kept for live safety net)
+    #   remove drawdown     -> 505.8/1.50/-24.1  (value: +54pp; earns it in
+    #                          crash regimes 2020-23: 110.8 vs 58.4 without)
     DAILY_LOSS_LIMIT_PCT: float = -0.03     # Stop trading if down 3% today
     MAX_DRAWDOWN_LIMIT_PCT: float = -0.10   # Circuit breaker at -10%
     CIRCUIT_BREAKER_COOLDOWN_HOURS: int = 24
@@ -2460,7 +2467,10 @@ class BacktestEngine:
                     stop_triggered = False
                     reason = ''
 
-                    if self.config.STOP_MODE == 'trail21':
+                    if self.config.STOP_MODE == 'off':
+                        # v9.2 ablation: sell-side stops fully disabled
+                        pass
+                    elif self.config.STOP_MODE == 'trail21':
                         # Alternative framework: trailing stop off the 21-day
                         # closing high (chandelier-style), replaces tiered stops
                         if t >= 20:
@@ -3181,7 +3191,11 @@ class IntradayMonitor:
             
             stop = False
             reason = ''
-            
+
+            # v9.2 ablation: STOP_MODE='off' disables sell-side stops (live parity)
+            if self.config.STOP_MODE == 'off':
+                continue
+
             # Hard stop check
             if pnl_pct <= self.config.HARD_STOP_LOSS_PCT:
                 stop, reason = True, 'hard_stop'
