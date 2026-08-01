@@ -259,7 +259,18 @@ class Config:
     RV90_BUY_BLOCK_ENABLED: bool = False  # block NEW buys when 21d ann. vol > RV90_MAX_VOL
     RV90_MAX_VOL: float = 0.90
     BREADTH_SCALING_ENABLED: bool = False # pos_factor *= fraction of universe with r252 > 0
-    
+    # v9.2 experiment: stall-swap - replace high-ranked but stalling picks
+    # (21d return <= 0) with lower-ranked momentum-confirmed candidates.
+    # 'off' (default) | 'filter' (hard-exclude stallers) | 'swap' (swap only
+    # top-6 stallers for next-ranked candidate with r21 > 0 AND r126 no worse)
+    # WARNING: tested and REJECTED 2026-07-31 (full pool, v8.9 base):
+    #   base 559.6/1.59/-22.8 vs filter 167.9/0.92/-25.7 vs swap 270.2/1.15/-24.9
+    #   both variants lose both segments and 5 of 6 years - swapping out
+    #   short-term-weak long-term winners systematically buys hot names at
+    #   local peaks (reversal penalty) and destroys sleeve diversification.
+    STALL_SWAP_MODE: str = 'off'
+    STALL_LOOKBACK: int = 21
+
     # === Portfolio Risk ===
     DAILY_LOSS_LIMIT_PCT: float = -0.03     # Stop trading if down 3% today
     MAX_DRAWDOWN_LIMIT_PCT: float = -0.10   # Circuit breaker at -10%
@@ -1815,7 +1826,72 @@ class PortfolioConstructor:
             else:
                 filtered[sym] = data
         return filtered
-    
+
+    def filter_stall(self, signals: Dict[str, Dict], prices: pd.DataFrame,
+                     t: int) -> Dict[str, Dict]:
+        """
+        v9.2 experiment (STALL_SWAP_MODE, default off): 涨不动置换。
+        候选按 total 分排序。'filter': 硬性剔除近 STALL_LOOKBACK 日收益 <= 0
+        的候选(顺位递补)。'swap': 仅置换前 MAX_POSITIONS 中涨不动的成员,
+        递补者必须 r21 > 0 且 r126 不弱于被置换者(动量自然很强); 无合格
+        递补则保留原成员。已持仓个股不受此过滤影响(由独立止损逻辑管理)。
+        """
+        mode = self.config.STALL_SWAP_MODE
+        lb = self.config.STALL_LOOKBACK
+        if mode == 'off' or not signals or t < max(126, lb):
+            return signals
+
+        def ret(sym, n):
+            if sym not in prices.columns or t < n:
+                return None
+            p0 = prices[sym].iloc[t - n]
+            p1 = prices[sym].iloc[t]
+            if p0 <= 0 or pd.isna(p0) or pd.isna(p1):
+                return None
+            return p1 / p0 - 1
+
+        items = list(signals.items())
+        if mode == 'filter':
+            out = {}
+            for sym, data in items:
+                r21 = ret(sym, lb)
+                if r21 is None or r21 > 0:
+                    out[sym] = data
+                else:
+                    logger.info(f"STALL-FILTER: {sym} EXCLUDED (r{lb}={r21:+.1%} <= 0)")
+            return out
+
+        # mode == 'swap'
+        top_n = self.config.MAX_POSITIONS
+        head, tail = items[:top_n], items[top_n:]
+        used = {s for s, _ in head}
+        out = []
+        for sym, data in head:
+            r21 = ret(sym, lb)
+            if r21 is None or r21 > 0:
+                out.append((sym, data))
+                continue
+            r126_stall = ret(sym, 126)
+            repl = None
+            for csym, cdata in tail:
+                if csym in used:
+                    continue
+                cr21 = ret(csym, lb)
+                cr126 = ret(csym, 126)
+                if (cr21 is not None and cr21 > 0 and cr126 is not None
+                        and (r126_stall is None or cr126 >= r126_stall)):
+                    repl = (csym, cdata)
+                    break
+            if repl:
+                logger.info(f"STALL-SWAP: {sym} (r{lb}={r21:+.1%}, r126={r126_stall:+.1%}) "
+                            f"-> {repl[0]} (r{lb}={ret(repl[0], lb):+.1%}, r126={ret(repl[0], 126):+.1%})")
+                used.add(repl[0])
+                out.append(repl)
+            else:
+                out.append((sym, data))
+        out.extend((s, d) for s, d in tail if s not in used)
+        return dict(out)
+
     # HP-007 FIX: Removed unused `fundamentals` parameter
     def allocate(self, signals: Dict[str, Dict], capital: float, prices: pd.DataFrame,
                  t: int) -> Dict[str, int]:
@@ -2573,6 +2649,8 @@ class BacktestEngine:
                 combined = constructor.filter_21d_high(combined, prices, t)
                 # 全局波动率过滤: 所有策略信号统一检查20日波动率
                 combined = constructor.filter_by_volatility(combined, prices, t)
+                # v9.2 experiment: stall-swap (STALL_SWAP_MODE, default off)
+                combined = constructor.filter_stall(combined, prices, t)
 
                 # Determine execution price
                 if use_next_day_open and t + 1 < n_days:
@@ -3217,6 +3295,8 @@ class IntradayMonitor:
             combined = self.constructor.filter_21d_high(combined, prices, t)
             # 全局波动率过滤: 所有策略信号统一检查20日波动率
             combined = self.constructor.filter_by_volatility(combined, prices, t)
+            # v9.2 experiment: stall-swap (STALL_SWAP_MODE, default off)
+            combined = self.constructor.filter_stall(combined, prices, t)
             signals = [s[0] for s in sorted(combined.items(), key=lambda x: x[1]['total'], reverse=True)[:self.config.MAX_POSITIONS]]
             
             logger.info(f"Signals generated: {signals} | Regime: {regime}")
