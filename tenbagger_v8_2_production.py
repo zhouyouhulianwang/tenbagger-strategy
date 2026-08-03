@@ -259,6 +259,22 @@ class Config:
     RV90_BUY_BLOCK_ENABLED: bool = False  # block NEW buys when 21d ann. vol > RV90_MAX_VOL
     RV90_MAX_VOL: float = 0.90
     BREADTH_SCALING_ENABLED: bool = False # pos_factor *= fraction of universe with r252 > 0
+    # v9.2 experiment: exhaustion-layer overlays (ported from an external
+    # research table, 2026-07-31). Daily de-gross to 50% while triggered,
+    # restore via forced rebalance on clear (same mechanics as VIX_HALVE).
+    # Leader group = current holdings; distance = vs 252d closing high.
+    # Breadth = fraction of universe with r252 > 0 (same as BREADTH_SCALING).
+    # WARNING: tested and REJECTED on our system 2026-07-31 (v8.9 base
+    # 559.6/1.59/-22.8): leader 279.3/1.23/-28.9 (their best signal INVERTS -
+    # 2022: -8.2 vs +3.8), combo 200.2/1.04/-29.1; breadth 496.7/1.52/-19.3
+    # improves MDD but fails segment consistency (2020-23: 81.9 vs 110.8).
+    # Their table does not transfer: our daily-loss limit + hard stops
+    # already do the crash defense; halving on leader pullbacks sells the
+    # dips our alpha comes from (see stall-swap rejection).
+    EXHAUST_LEADER_HIGH_ENABLED: bool = False  # median leader dist-from-252d-high < threshold -> halve
+    EXHAUST_LEADER_HIGH_PCT: float = -0.08
+    EXHAUST_BREADTH_ENABLED: bool = False      # breadth drops EXHAUST_BREADTH_DROP in 21d -> halve
+    EXHAUST_BREADTH_DROP: float = 0.15
     # v9.2 experiment: stall-swap - replace high-ranked but stalling picks
     # (21d return <= 0) with lower-ranked momentum-confirmed candidates.
     # 'off' (default) | 'filter' (hard-exclude stallers) | 'swap' (swap only
@@ -2429,6 +2445,12 @@ class BacktestEngine:
         hedge_shares = 0    # SQQQ shares (managed by hedge engine, not stops)
         hedge_entry = 0.0
         degrossed = False   # VIX-halve overlay state (alternative framework)
+        exh_degrossed = False   # v9.2 exhaustion-overlay state
+        exh_half_days = 0
+        # v9.2: precompute breadth (fraction of universe with r252 > 0) once
+        breadth_series = None
+        if self.config.EXHAUST_BREADTH_ENABLED:
+            breadth_series = (sel_prices / sel_prices.shift(252) > 1).mean(axis=1)
         portfolio_values = []
         trades = []
         daily_rets = []
@@ -2619,6 +2641,55 @@ class BacktestEngine:
                         degrossed = False
                         self._last_t = t - self.config.REBALANCE_DAYS  # force re-entry at next step
 
+            # 2.8 v9.2 experiment: exhaustion overlays (leader-high-distance
+            # and/or breadth-momentum) -> halve stock exposure while triggered
+            if (self.config.EXHAUST_LEADER_HIGH_ENABLED
+                    or self.config.EXHAUST_BREADTH_ENABLED):
+                exh_triggered = False
+                if (self.config.EXHAUST_LEADER_HIGH_ENABLED
+                        and positions and t >= 252):
+                    dists = []
+                    for sym, shares in positions.items():
+                        if shares > 0 and sym in prices.columns \
+                                and current_prices[sym] > 0:
+                            h = prices[sym].iloc[t - 251:t + 1].max()
+                            if h > 0:
+                                dists.append(current_prices[sym] / h - 1)
+                    if dists and float(np.median(dists)) < self.config.EXHAUST_LEADER_HIGH_PCT:
+                        exh_triggered = True
+                if (not exh_triggered and self.config.EXHAUST_BREADTH_ENABLED
+                        and breadth_series is not None and t >= 273):
+                    b_now = breadth_series.iloc[t]
+                    b_prev = breadth_series.iloc[t - 21]
+                    if not (np.isnan(b_now) or np.isnan(b_prev)) \
+                            and b_now < b_prev - self.config.EXHAUST_BREADTH_DROP:
+                        exh_triggered = True
+                if exh_triggered and not exh_degrossed:
+                    for sym, shares in list(positions.items()):
+                        sell_q = int(shares * 0.5)
+                        if sell_q > 0 and sym in current_prices and current_prices[sym] > 0:
+                            price = current_prices[sym]
+                            _fa = fundamentals.get_asof(sym, current_date, price)
+                            mkt_cap = _fa.get('market_cap', 0) or 50e9
+                            net_price = txn.apply_to_backtest(price, sell_q, is_buy=False,
+                                                              market_cap=mkt_cap, config=self.config)
+                            cash += sell_q * net_price
+                            entry = entry_prices.get(sym, net_price)
+                            trades.append({'date': current_date, 'symbol': sym, 'action': 'SELL',
+                                           'reason': 'exhaust_halve', 'shares': sell_q,
+                                           'price': price, 'net_price': net_price,
+                                           'pnl_pct': (net_price - entry) / entry if entry > 0 else 0})
+                            positions[sym] = shares - sell_q
+                            if positions[sym] <= 0:
+                                positions.pop(sym); entry_prices.pop(sym, None)
+                                max_prices_tracker.pop(sym, None)
+                    exh_degrossed = True
+                elif not exh_triggered and exh_degrossed:
+                    exh_degrossed = False
+                    self._last_t = t - self.config.REBALANCE_DAYS  # force re-entry
+            if exh_degrossed:
+                exh_half_days += 1
+
             # 3. Rebalance check (v8.3: delta-based - keeps overlapping holdings,
             #    only trades the difference. v8.2 liquidated everything weekly,
             #    which made trailing stops unreachable and churned ~33x/yr.)
@@ -2774,12 +2845,13 @@ class BacktestEngine:
                                            'price': price, 'net_price': net_price, 'pnl_pct': pnl})
                             positions[sym] = cur_shares - reduce
         
-        self.results = self._calc_performance(portfolio_values, daily_rets, benchmark, trades, prices)
+        self.results = self._calc_performance(portfolio_values, daily_rets, benchmark, trades, prices,
+                                              exhaust_half_days=exh_half_days)
         return self.results
     
     def _calc_performance(self, pv_list: List[float], dr: List[float],
                           benchmark: pd.Series, trades: List[Dict],
-                          prices: pd.DataFrame) -> Dict:
+                          prices: pd.DataFrame, exhaust_half_days: int = 0) -> Dict:
         if not pv_list or len(pv_list) < 2:
             return {'error': 'Insufficient data'}
         
@@ -2849,6 +2921,7 @@ class BacktestEngine:
             'bench_return': bench_ret, 'bench_cagr': bench_cagr,
             'excess_return': total_ret - bench_ret,
             'n_trades': len(trades),
+            'exhaust_half_days': exhaust_half_days,
             'winning_trades': len(wins), 'losing_trades': len(losses),
             'avg_win': np.mean([t['pnl_pct'] for t in wins]) if wins else 0,
             'avg_loss': np.mean([t['pnl_pct'] for t in losses]) if losses else 0,
