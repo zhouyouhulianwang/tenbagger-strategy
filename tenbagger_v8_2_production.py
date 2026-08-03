@@ -3347,10 +3347,12 @@ class IntradayMonitor:
         try:
             logger.info("=" * 60)
             logger.info("WEEKLY REBALANCE STARTED [DCL Flow: Data→Signal→Order]")
-            # v9.1: rate-limit 4h (once per rebalance window) - the rebalance
-            # re-runs every cycle inside the Friday window (mostly no-op
-            # drift checks); min_interval=0 spammed Telegram every minute
-            self.notifier.send("🔄 周度调仓开始", key='rebalance_start', min_interval=14400)
+            # v9.1/v9.2: reports rate-limited 15min (retry runs re-notify per
+            # user directive 2026-08-03 "如有必要可以多次通知"); per-order
+            # fills use min_interval=0 - every real account change notifies.
+            # The v9.2 last_rebalance stamp fix removed the every-cycle
+            # re-runs that caused the original spam.
+            self.notifier.send("🔄 周度调仓开始", key='rebalance_start', min_interval=900)
 
             # v8.5 (P1-3): no orphan orders may interfere with the rebalance
             self.client.cancel_our_orders()
@@ -3452,7 +3454,7 @@ class IntradayMonitor:
             if not (plan_sells or plan_news or plan_adds):
                 pre_lines.append("持仓与信号一致，无需交易")
             self.notifier.send('\n'.join(pre_lines),
-                               key='pre_rebalance', min_interval=14400)
+                               key='pre_rebalance', min_interval=900)
 
             # === O: 执行下单 (Order Execution) ===
             # v8.5 (P0-2): the rebalance now runs INSIDE the trading window
@@ -3477,7 +3479,7 @@ class IntradayMonitor:
                             fills.append(f"卖出 {sym} {qty:g}股")
                             # v9.2: every account change -> Telegram
                             self.notifier.send(f"📤 调仓卖出: {sym} {qty:g}股",
-                                               key=f'rebal_sell_{sym}', min_interval=14400)
+                                               key=f'rebal_sell_{sym}', min_interval=0)
                         else:
                             logger.error(f"Sell {sym} failed")
                             failures.append(f'sell:{sym}')
@@ -3547,7 +3549,7 @@ class IntradayMonitor:
                         fills.append(f"买入 {sym} {buy_qty}股")
                         # v9.2: every account change -> Telegram
                         self.notifier.send(f"📥 调仓买入: {sym} {buy_qty}股",
-                                           key=f'rebal_buy_{sym}', min_interval=14400)
+                                           key=f'rebal_buy_{sym}', min_interval=0)
                     else:
                         logger.error(f"Buy {sym} failed")
                         failures.append(f'buy:{sym}')
@@ -3595,7 +3597,7 @@ class IntradayMonitor:
                 except Exception:
                     post_lines.append(f"equity ${equity:,.0f}（成交前读数）")
                 self.notifier.send('\n'.join(post_lines),
-                                   key='rebalance_done', min_interval=14400)
+                                   key='rebalance_done', min_interval=900)
             else:
                 logger.critical(f"WEEKLY REBALANCE PARTIAL FAILURE: {failures} - "
                                 f"will retry next cycle (account may be half-rotated)")
