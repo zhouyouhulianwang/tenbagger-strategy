@@ -217,7 +217,12 @@ class Config:
     INITIAL_CAPITAL: float = 100_000.0
     MAX_POSITIONS: int = 6
     REBALANCE_DAYS: int = 5  # Weekly
-    
+    # Live weekly rebalance anchor (Python weekday: 0=Mon ... 4=Fri).
+    # User directive 2026-08-03: Friday -> Monday. Note: the backtest engine
+    # rebalances every REBALANCE_DAYS trading days (weekday-agnostic), so
+    # this is an operational anchor, not a backtested parameter.
+    REBALANCE_WEEKDAY: int = 0
+
     # === Trading Hours (ET) ===
     TRADING_ENABLED: bool = True
     # v8.5: window is now enforced for rebalances and hedge switches (stops
@@ -3197,6 +3202,19 @@ class IntradayMonitor:
                 'max_prices': self.max_prices,
                 'last_save': now_et().isoformat(),
             }
+            # v9.2 fix: preserve last_rebalance across saves. Previously each
+            # _save_state rewrote state.json WITHOUT the stamp, so the
+            # should_rebalance "already rebalanced today" check never fired
+            # and do_rebalance re-ran EVERY cycle inside the window
+            # (continuous re-optimization + fractional top-up churn).
+            try:
+                if self.config.STATE_FILE.exists():
+                    with open(self.config.STATE_FILE) as f:
+                        _old = json.load(f)
+                    if _old.get('last_rebalance'):
+                        payload['last_rebalance'] = _old['last_rebalance']
+            except Exception:
+                pass
             payload.update(self.risk.state_dict())
             with open(tmp, 'w') as f:
                 json.dump(payload, f, indent=2)
@@ -3300,7 +3318,7 @@ class IntradayMonitor:
         # v8.5: market calendar is judged in US Eastern, not host local time
         # (a UTC host shifted the Friday decision into Saturday).
         today = now_et()
-        if today.weekday() != 4:  # Friday
+        if today.weekday() != self.config.REBALANCE_WEEKDAY:
             return False
         # Check if already rebalanced today
         if self.config.STATE_FILE.exists():
