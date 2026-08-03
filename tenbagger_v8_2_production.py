@@ -280,6 +280,21 @@ class Config:
     EXHAUST_LEADER_HIGH_PCT: float = -0.08
     EXHAUST_BREADTH_ENABLED: bool = False      # breadth drops EXHAUST_BREADTH_DROP in 21d -> halve
     EXHAUST_BREADTH_DROP: float = 0.15
+    # v9.2 experiment: liquidity floor (user directive 2026-08-03).
+    # Candidates need ADV20 (or latest day) share volume >= MIN_ADV_SHARES.
+    # 0 = off. WARNING: the 10M threshold is calibrated on CONSOLIDATED
+    # volume (backtest CSVs). Live bars come from the IEX feed (~2-3% of
+    # consolidated volume) - enabling live with 10M would filter out nearly
+    # everything; live use needs the SIP feed or a recalibrated threshold.
+    # WARNING: tested and REJECTED 2026-08-03 (v8.9 base 559.6/1.59/-22.8):
+    #   adv20_10m 93.9/0.72/-22.0, day_10m 133.8/0.91/-21.7 - both lose both
+    #   segments and every year. The floor amputates the strategy's core:
+    #   5 of the 6 current holdings fail it (only T passes); most-filtered
+    #   names are the alpha drivers (PEP/PG/EG/VRT/CINF). MDD unchanged -
+    #   zero risk benefit. Positions ~$30K vs $130M+ daily dollar volume of
+    #   even the thinnest holding: liquidity is a non-issue at this size.
+    MIN_ADV_SHARES: float = 0
+    MIN_ADV_MODE: str = 'adv20'    # 'adv20' (20d mean) | 'day' (latest day)
     # v9.2 experiment: stall-swap - replace high-ranked but stalling picks
     # (21d return <= 0) with lower-ranked momentum-confirmed candidates.
     # 'off' (default) | 'filter' (hard-exclude stallers) | 'swap' (swap only
@@ -883,6 +898,7 @@ class AlpacaClient:
         return pd.Series(df['c'].values, index=df['t'], name=symbol)
 
     def get_bars_batch(self, symbols: List[str], days: int = 400) -> Dict[str, pd.Series]:
+        self._last_bar_volumes = {}  # v9.2: reset (batch path fills it)
         """v8.5: multi-symbol bars in a few paginated requests.
 
         The old per-symbol loop made ~520 requests at ~6.7 req/s, over the
@@ -933,11 +949,16 @@ class AlpacaClient:
                 time.sleep(0.35)  # <200 req/min on the free tier
             return result
 
+        vols: Dict[str, pd.Series] = {}
         for sym, bars in collected.items():
             if len(bars) > 30:
                 df = pd.DataFrame(bars)
                 df['t'] = pd.to_datetime(df['t']).dt.tz_localize(None)
                 result[sym] = pd.Series(df['c'].values, index=df['t'], name=sym)
+                # v9.2: keep share volume for the liquidity floor (IEX feed!)
+                if 'v' in df.columns:
+                    vols[sym] = pd.Series(df['v'].values, index=df['t'], name=sym)
+        self._last_bar_volumes = vols
         logger.info(f"Batch bars: {len(result)}/{len(symbols)} symbols in {pages} page(s)")
         return result
 
@@ -1920,6 +1941,36 @@ class PortfolioConstructor:
         out.extend((s, d) for s, d in tail if s not in used)
         return dict(out)
 
+    def filter_by_adv(self, signals: Dict[str, Dict], volumes: pd.DataFrame,
+                      t: int) -> Dict[str, Dict]:
+        """
+        v9.2 experiment (MIN_ADV_SHARES, default off): 流动性门槛。
+        排除20日日均成交量(MIN_ADV_MODE='day'时为当日成交量)低于阈值的候选。
+        已持仓个股不受此过滤影响(由独立止损逻辑管理)。
+        无成交量数据的标的保守放行。
+        """
+        if (self.config.MIN_ADV_SHARES <= 0 or not signals
+                or volumes is None or t < 20):
+            return signals
+        out = {}
+        for sym, data in signals.items():
+            if sym in volumes.columns:
+                v = volumes[sym].iloc[:t + 1].dropna()
+                if len(v) >= 20:
+                    adv = (v.iloc[-20:].mean() if self.config.MIN_ADV_MODE == 'adv20'
+                           else v.iloc[-1])
+                    if adv >= self.config.MIN_ADV_SHARES:
+                        out[sym] = data
+                    else:
+                        logger.info(f"ADV-FILTER: {sym} EXCLUDED "
+                                    f"({self.config.MIN_ADV_MODE} vol={adv:,.0f} "
+                                    f"< min={self.config.MIN_ADV_SHARES:,.0f})")
+                else:
+                    out[sym] = data
+            else:
+                out[sym] = data
+        return out
+
     # HP-007 FIX: Removed unused `fundamentals` parameter
     def allocate(self, signals: Dict[str, Dict], capital: float, prices: pd.DataFrame,
                  t: int) -> Dict[str, int]:
@@ -2412,11 +2463,13 @@ class BacktestEngine:
     
     def run(self, prices: pd.DataFrame, benchmark: pd.Series,
             fundamentals: RealtimeFundamentals, use_next_day_open: bool = True,
-            vix: pd.Series = None) -> Dict:
+            vix: pd.Series = None, volumes: pd.DataFrame = None) -> Dict:
         """
         Run backtest.
 
         Args:
+            volumes: optional share-volume panel (same shape as prices), used
+                     only by the MIN_ADV_SHARES liquidity floor (v9.2).
             use_next_day_open: If True, rebalance executes at t+1 price
                               (simulates EOD signal -> next day execution)
             vix: Optional VIX close series (DatetimeIndex) driving the
@@ -2737,6 +2790,8 @@ class BacktestEngine:
                 combined = constructor.filter_by_volatility(combined, prices, t)
                 # v9.2 experiment: stall-swap (STALL_SWAP_MODE, default off)
                 combined = constructor.filter_stall(combined, prices, t)
+                # v9.2 experiment: liquidity floor (MIN_ADV_SHARES, default off)
+                combined = constructor.filter_by_adv(combined, volumes, t)
 
                 # Determine execution price
                 if use_next_day_open and t + 1 < n_days:
@@ -3404,6 +3459,14 @@ class IntradayMonitor:
             combined = self.constructor.filter_by_volatility(combined, prices, t)
             # v9.2 experiment: stall-swap (STALL_SWAP_MODE, default off)
             combined = self.constructor.filter_stall(combined, prices, t)
+            # v9.2 experiment: liquidity floor (MIN_ADV_SHARES, default off).
+            # NB: live volumes are IEX-feed (~2-3% of consolidated)
+            volumes = None
+            if self.config.MIN_ADV_SHARES > 0:
+                _vols = getattr(self.client, '_last_bar_volumes', None)
+                if _vols:
+                    volumes = pd.DataFrame(_vols).dropna(how='all').ffill()
+            combined = self.constructor.filter_by_adv(combined, volumes, t)
             signals = [s[0] for s in sorted(combined.items(), key=lambda x: x[1]['total'], reverse=True)[:self.config.MAX_POSITIONS]]
             
             logger.info(f"Signals generated: {signals} | Regime: {regime}")
