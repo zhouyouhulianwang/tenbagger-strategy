@@ -3425,6 +3425,35 @@ class IntradayMonitor:
                             * msignal.get('position_factor', 1.0))
             target = self.rebalancer.smart_rebalance(prices, current_symbols, signals, stock_equity)
 
+            # === v9.2 (user standing rule 2026-08-03): PRE-rebalance report
+            # via Telegram BEFORE any order is sent ===
+            fills = []  # collected for the post-rebalance report
+            plan_sells = [s for s in current_symbols
+                          if s != self.config.HEDGE_ETF and s not in target]
+            plan_news, plan_adds = [], []
+            for sym, qty in target.items():
+                cq = next((int(float(p['qty'])) for p in current_positions
+                           if p['symbol'] == sym), 0)
+                if qty > cq:
+                    px = float(prices[sym].iloc[-1])
+                    w = qty * px / equity if equity > 0 else 0
+                    if cq == 0:
+                        plan_news.append(f"{sym} {qty}股(约{w:.0%})")
+                    else:
+                        plan_adds.append(f"{sym} {cq}→{qty}股")
+            pre_lines = [f"📋 预调仓报告 | regime={regime}",
+                         f"信号: {', '.join(signals)} | equity ${equity:,.0f}"]
+            if plan_sells:
+                pre_lines.append(f"卖出(跌出信号前{self.config.MAX_POSITIONS}): {', '.join(plan_sells)}")
+            if plan_news:
+                pre_lines.append(f"新买入: {', '.join(plan_news)}")
+            if plan_adds:
+                pre_lines.append(f"补仓至目标权重: {', '.join(plan_adds)}")
+            if not (plan_sells or plan_news or plan_adds):
+                pre_lines.append("持仓与信号一致，无需交易")
+            self.notifier.send('\n'.join(pre_lines),
+                               key='pre_rebalance', min_interval=14400)
+
             # === O: 执行下单 (Order Execution) ===
             # v8.5 (P0-2): the rebalance now runs INSIDE the trading window
             # while the market is open, so sells fill immediately and cash is
@@ -3445,6 +3474,10 @@ class IntradayMonitor:
                         order = self.client.submit_order(sym, qty, 'sell')
                         if order and order.get('status') in ('filled', 'accepted', 'new', 'partially_filled'):
                             logger.info(f"Sell {sym}: {qty} shares OK")
+                            fills.append(f"卖出 {sym} {qty:g}股")
+                            # v9.2: every account change -> Telegram
+                            self.notifier.send(f"📤 调仓卖出: {sym} {qty:g}股",
+                                               key=f'rebal_sell_{sym}', min_interval=14400)
                         else:
                             logger.error(f"Sell {sym} failed")
                             failures.append(f'sell:{sym}')
@@ -3511,6 +3544,10 @@ class IntradayMonitor:
                     order = self.client.submit_order(sym, buy_qty, 'buy')
                     if order and order.get('status') in ('filled', 'accepted', 'new', 'partially_filled'):
                         logger.info(f"Buy {sym}: {buy_qty} shares OK")
+                        fills.append(f"买入 {sym} {buy_qty}股")
+                        # v9.2: every account change -> Telegram
+                        self.notifier.send(f"📥 调仓买入: {sym} {buy_qty}股",
+                                           key=f'rebal_buy_{sym}', min_interval=14400)
                     else:
                         logger.error(f"Buy {sym} failed")
                         failures.append(f'buy:{sym}')
@@ -3537,10 +3574,28 @@ class IntradayMonitor:
                 except Exception as e:
                     logger.warning(f"last_rebalance stamp failed: {e}")
                 logger.info("WEEKLY REBALANCE COMPLETED")
-                tgt = ', '.join(f'{s}' for s in target.keys())
-                self.notifier.send(
-                    f"✅ 周度调仓完成 | regime={regime} | 目标: {tgt} | equity ${equity:,.0f}",
-                    key='rebalance_done', min_interval=14400)
+                # v9.2 (user standing rule 2026-08-03): full POST-rebalance
+                # report via Telegram - fills, holdings, equity/cash
+                post_lines = [f"✅ 调仓报告 | regime={regime}"]
+                if fills:
+                    post_lines.append("成交: " + ' / '.join(fills))
+                else:
+                    post_lines.append("成交: 无（持仓与信号一致）")
+                try:
+                    pos_now = self.client.get_positions()
+                    acct_now = self.client.get_account()
+                    if pos_now:
+                        hold = ', '.join(f"{p['symbol']} {float(p['qty']):g}"
+                                         for p in pos_now
+                                         if p['symbol'] != self.config.HEDGE_ETF)
+                        post_lines.append(f"持仓: {hold}")
+                    if acct_now:
+                        post_lines.append(f"equity ${float(acct_now['equity']):,.0f} | "
+                                          f"cash ${float(acct_now['cash']):,.0f}")
+                except Exception:
+                    post_lines.append(f"equity ${equity:,.0f}（成交前读数）")
+                self.notifier.send('\n'.join(post_lines),
+                                   key='rebalance_done', min_interval=14400)
             else:
                 logger.critical(f"WEEKLY REBALANCE PARTIAL FAILURE: {failures} - "
                                 f"will retry next cycle (account may be half-rotated)")
