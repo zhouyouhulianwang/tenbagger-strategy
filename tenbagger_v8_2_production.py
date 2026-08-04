@@ -3491,7 +3491,9 @@ class IntradayMonitor:
             target = self.rebalancer.smart_rebalance(prices, current_symbols, signals, stock_equity)
 
             # === v9.2 (user standing rule 2026-08-03): PRE-rebalance report
-            # via Telegram BEFORE any order is sent ===
+            # via Telegram BEFORE any order is sent. Includes the full
+            # ranking detail and the weight calculation process (user
+            # directive 2026-08-03). ===
             fills = []  # collected for the post-rebalance report
             plan_sells = [s for s in current_symbols
                           if s != self.config.HEDGE_ETF and s not in target]
@@ -3500,20 +3502,52 @@ class IntradayMonitor:
                 cq = next((int(float(p['qty'])) for p in current_positions
                            if p['symbol'] == sym), 0)
                 if qty > cq:
-                    px = float(prices[sym].iloc[-1])
-                    w = qty * px / equity if equity > 0 else 0
                     if cq == 0:
-                        plan_news.append(f"{sym} {qty}股(约{w:.0%})")
+                        plan_news.append(f"{sym} {qty}股")
                     else:
                         plan_adds.append(f"{sym} {cq}→{qty}股")
-            pre_lines = [f"📋 预调仓报告 | regime={regime}",
-                         f"信号: {', '.join(signals)} | equity ${equity:,.0f}"]
+
+            # --- ranking detail: top-8 with total score + sleeve breakdown ---
+            abbr = {'momentum': '动', 'sector': '行', 'growth': '成',
+                    'value': '价', 'defensive': '防'}
+            rank_of = {s: i for i, (s, _) in enumerate(combined.items(), 1)}
+            rank_lines = []
+            for i, (sym, d) in enumerate(list(combined.items())[:8], 1):
+                parts = [f"{abbr[k]}{d.get(k + '_score', 0):.2f}"
+                         for k in abbr if d.get(k + '_score', 0) > 0]
+                if d.get('n_strategies', 1) > 1:
+                    parts.append(f"共振x{d['n_strategies']}")
+                mark = ''
+                if i == self.config.MAX_POSITIONS:
+                    mark = '  ← 入选线'
+                elif i == self.config.MAX_POSITIONS + 1:
+                    mark = '  ← 落选'
+                rank_lines.append(f"{i}. {sym} 总分{d['total']:.3f} [{' '.join(parts)}]{mark}")
+
+            # --- weight calculation process (equal-weight: stock_equity / N) ---
+            pf = msignal.get('position_factor', 1.0)
+            comp = self.hedge.get_stock_compression()
+            per = stock_equity / len(signals) if signals else 0
+            calc_lines = [f"权重计算: ${equity:,.0f} × pf={pf:.2f} × 压缩={comp:.2f}"
+                          f" = ${stock_equity:,.0f} ÷ {len(signals)}票 = ${per:,.0f}/票"]
+            for sym, qty in target.items():
+                px = float(prices[sym].iloc[-1])
+                calc_lines.append(f"  {sym} {qty}股 @${px:,.2f} → {qty * px / equity:.1%}")
+
+            # --- planned actions with reasons ---
+            pre_lines = [f"📋 预调仓报告 | regime={regime} (pf={pf:.2f})", '']
+            pre_lines += rank_lines
+            pre_lines.append('')
+            pre_lines += calc_lines
+            pre_lines.append('')
             if plan_sells:
-                pre_lines.append(f"卖出(跌出信号前{self.config.MAX_POSITIONS}): {', '.join(plan_sells)}")
+                desc = [f"{s}({'落选#' + str(rank_of[s]) if s in rank_of else '未入选任何袖珍'})"
+                        for s in plan_sells]
+                pre_lines.append(f"卖出: {', '.join(desc)}")
             if plan_news:
                 pre_lines.append(f"新买入: {', '.join(plan_news)}")
             if plan_adds:
-                pre_lines.append(f"补仓至目标权重: {', '.join(plan_adds)}")
+                pre_lines.append(f"补仓: {', '.join(plan_adds)}")
             if not (plan_sells or plan_news or plan_adds):
                 pre_lines.append("持仓与信号一致，无需交易")
             self.notifier.send('\n'.join(pre_lines),
@@ -3649,10 +3683,12 @@ class IntradayMonitor:
                 try:
                     pos_now = self.client.get_positions()
                     acct_now = self.client.get_account()
+                    eq_now = float(acct_now['equity']) if acct_now else equity
                     if pos_now:
-                        hold = ', '.join(f"{p['symbol']} {float(p['qty']):g}"
-                                         for p in pos_now
-                                         if p['symbol'] != self.config.HEDGE_ETF)
+                        hold = ', '.join(
+                            f"{p['symbol']} {float(p['qty']):g}股({float(p['market_value']) / eq_now:.0%})"
+                            for p in pos_now
+                            if p['symbol'] != self.config.HEDGE_ETF)
                         post_lines.append(f"持仓: {hold}")
                     if acct_now:
                         post_lines.append(f"equity ${float(acct_now['equity']):,.0f} | "
