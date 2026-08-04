@@ -214,6 +214,7 @@ class Config:
     """Production configuration - all parameters in one place."""
     
     # === General ===
+    VERSION: str = 'v9.2'
     INITIAL_CAPITAL: float = 100_000.0
     MAX_POSITIONS: int = 6
     REBALANCE_DAYS: int = 5  # Weekly
@@ -3711,7 +3712,7 @@ class IntradayMonitor:
         lines = []
         lines.append("")
         lines.append("=" * 70)
-        lines.append(f"  MONITOR v8.5 {now_et().strftime('%Y-%m-%d %H:%M:%S')} ET")
+        lines.append(f"  MONITOR {self.config.VERSION} {now_et().strftime('%Y-%m-%d %H:%M:%S')} ET")
         
         equity = float(acct.get('equity', 0))
         
@@ -3883,15 +3884,19 @@ class IntradayMonitor:
         if not self._acquire_instance_lock():
             sys.exit(1)
         print("=" * 70)
-        print("  TENBAGGER v8.5 - Production Monitor")
+        print(f"  TENBAGGER {self.config.VERSION} - Production Monitor")
         print("  Features: Stop loss | Daily loss limit | Drawdown circuit | Weekly rebalance")
         print("  PDT guard | Kill switch | Atomic state | Instance lock | PIT fundamentals")
         print("=" * 70)
         print("  Ctrl+C to stop")
 
+        # v9.2: startup notification must reflect actual config (user
+        # directive 2026-08-04: notifications must be accurate) - rebalance
+        # weekday and version are read live, not hardcoded
+        _wd = ['周一', '周二', '周三', '周四', '周五', '周六', '周日'][self.config.REBALANCE_WEEKDAY]
         mode = 'LIVE' if 'paper' not in self.config.ALPACA_BASE_URL else 'paper'
-        self.notifier.send(f"🚀 Tenbagger monitor 已启动 ({mode}, v9.0) | "
-                           f"止损/日亏/回撤熔断/周五调仓 | Telegram 通知已开启",
+        self.notifier.send(f"🚀 Tenbagger monitor 已启动 ({mode}, {self.config.VERSION}) | "
+                           f"止损/日亏/回撤熔断/{_wd}调仓 | Telegram 通知已开启",
                            key='startup', min_interval=0)
         cycle = 0
         try:
