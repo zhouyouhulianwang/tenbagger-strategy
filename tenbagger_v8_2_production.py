@@ -326,6 +326,16 @@ class Config:
     DAILY_LOSS_LIMIT_PCT: float = -0.03     # Stop trading if down 3% today
     MAX_DRAWDOWN_LIMIT_PCT: float = -0.10   # Circuit breaker at -10%
     CIRCUIT_BREAKER_COOLDOWN_HOURS: int = 24
+    # v9.2 experiment (prompted by the 2026-08-05 DVA gap-down event): after
+    # a risk liquidation (daily-loss limit or drawdown breaker), when should
+    # the portfolio re-enter? 'scheduled' = current behaviour, sit in cash
+    # until the next regular rebalance (live: next Monday; backtest: next
+    # 5-day boundary). 'next_day' / 'cooldown_2d' force a rebalance 1 / 2
+    # trading days after the event (same _last_t offset trick as the
+    # VIX_HALVE restore). Drawdown-breaker events still wait out
+    # CIRCUIT_BREAKER_COOLDOWN_HOURS first. Live ignores this switch until a
+    # backtest verdict; default keeps current behaviour.
+    RISK_REENTRY_MODE: str = 'scheduled'   # 'scheduled' | 'next_day' | 'cooldown_2d'
 
     # === Pattern Day Trader (PDT) protection (v8.5) ===
     # FINRA: >=4 day trades in 5 business days with equity < $25k -> account
@@ -2646,6 +2656,15 @@ class BacktestEngine:
                 portfolio_values[-1] = cash
                 if daily_rets:
                     daily_rets[-1] = portfolio_values[-1] / portfolio_values[-2] - 1
+                # v9.2 experiment: RISK_REENTRY_MODE (see Config). Default
+                # 'scheduled' leaves _last_t untouched -> cash until the next
+                # regular rebalance. Forced modes re-enter 1/2 trading days
+                # after the event (drawdown-breaker events still wait out the
+                # circuit cooldown because check_limits gates every day).
+                if self.config.RISK_REENTRY_MODE == 'next_day':
+                    self._last_t = t - self.config.REBALANCE_DAYS
+                elif self.config.RISK_REENTRY_MODE == 'cooldown_2d':
+                    self._last_t = t - self.config.REBALANCE_DAYS + 2
                 continue
 
             # 2.6 v8.3: conditional hedge (same hysteresis rules as live)
