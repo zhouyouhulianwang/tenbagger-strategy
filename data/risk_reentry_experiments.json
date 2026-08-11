@@ -28,5 +28,65 @@
   "seg_2024_2026": 214.0,
   "spy_seg_2020_2023": 25.5,
   "spy_seg_2024_2026": 56.7
+ },
+ "next_day": {
+  "total_return": 464.3,
+  "cagr": 36.8,
+  "sharpe": 1.43,
+  "mdd": -33.7,
+  "excess": 368.6,
+  "n_trades": 1516,
+  "sell_reasons": {
+   "hard_stop": 58,
+   "rebalance": 378,
+   "rebalance_trim": 124,
+   "risk_daily_loss_limit": 156,
+   "risk_max_drawdown": 51
+  },
+  "n_risk_events": 41,
+  "avg_idle_cal_days": 3.2,
+  "max_idle_cal_days": 6,
+  "yearly": {
+   "2021": 20.2,
+   "2022": 14.8,
+   "2023": 37.7,
+   "2024": 93.9,
+   "2025": 10.6,
+   "2026": 35.3
+  },
+  "seg_2020_2023": 91.4,
+  "seg_2024_2026": 195.8,
+  "spy_seg_2020_2023": 25.5,
+  "spy_seg_2024_2026": 56.7
+ },
+ "cooldown_2d": {
+  "total_return": 374.4,
+  "cagr": 32.6,
+  "sharpe": 1.35,
+  "mdd": -23.2,
+  "excess": 278.8,
+  "n_trades": 1554,
+  "sell_reasons": {
+   "hard_stop": 57,
+   "rebalance": 394,
+   "rebalance_trim": 135,
+   "risk_daily_loss_limit": 164,
+   "risk_max_drawdown": 37
+  },
+  "n_risk_events": 38,
+  "avg_idle_cal_days": 4.9,
+  "max_idle_cal_days": 8,
+  "yearly": {
+   "2021": 13.4,
+   "2022": 11.1,
+   "2023": 40.3,
+   "2024": 55.0,
+   "2025": 40.3,
+   "2026": 23.4
+  },
+  "seg_2020_2023": 76.1,
+  "seg_2024_2026": 175.6,
+  "spy_seg_2020_2023": 25.5,
+  "spy_seg_2024_2026": 56.7
  }
 }

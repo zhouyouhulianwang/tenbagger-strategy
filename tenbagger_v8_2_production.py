@@ -333,8 +333,15 @@ class Config:
     # 5-day boundary). 'next_day' / 'cooldown_2d' force a rebalance 1 / 2
     # trading days after the event (same _last_t offset trick as the
     # VIX_HALVE restore). Drawdown-breaker events still wait out
-    # CIRCUIT_BREAKER_COOLDOWN_HOURS first. Live ignores this switch until a
-    # backtest verdict; default keeps current behaviour.
+    # CIRCUIT_BREAKER_COOLDOWN_HOURS first.
+    # WARNING: tested and REJECTED 2026-08-11 (v9.2 base 559.6/1.59/-22.8,
+    # 40 risk events, avg idle 4.5 cal days): next_day 464.3/1.43/-33.7
+    # (MDD +10.9pp - immediate re-entry buys the falling knife; breaker
+    # re-triggers 34->51 = whipsaw), cooldown_2d 374.4/1.35/-23.2; both
+    # fail both segments. The post-event idle window is where a large share
+    # of the daily-loss limit's protective value comes from - risk
+    # liquidations cluster in crashes and the scheduled wait skips the
+    # continuation days. KEEP 'scheduled'.
     RISK_REENTRY_MODE: str = 'scheduled'   # 'scheduled' | 'next_day' | 'cooldown_2d'
 
     # === Pattern Day Trader (PDT) protection (v8.5) ===
