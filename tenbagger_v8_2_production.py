@@ -260,6 +260,13 @@ class Config:
     TELEGRAM_CHAT_ID: str = field(default_factory=lambda: os.environ.get('TELEGRAM_CHAT_ID', ''))
     STOP_MODE: str = 'tiered'             # 'tiered' (current) | 'trail21' (21d-high -15%) | 'off' (ablation only)
     TRAIL21_STOP_PCT: float = -0.15       # exit when close < 21d high * (1 + pct)
+    # v9.2 stop-event dedupe (live only, no strategy change): after a stop
+    # sell is submitted, Alpaca's position list can lag several cycles -
+    # re-firing re-submitted duplicate sells and spammed Telegram
+    # (DVA notified 4x within 4 min on 2026-08-05). Within this window a
+    # repeated trigger is logged but neither re-notified nor re-submitted;
+    # beyond it (position still present = order likely rejected) we retry.
+    STOP_RESUBMIT_SEC: int = 300
     VIX_HALVE_ENABLED: bool = False       # prev-day VIX >= threshold -> halve stock exposure
     VIX_HALVE_THRESHOLD: float = 30.0
     RV90_BUY_BLOCK_ENABLED: bool = False  # block NEW buys when 21d ann. vol > RV90_MAX_VOL
@@ -3193,6 +3200,7 @@ class IntradayMonitor:
         self.notifier = Notifier(self.config)
         self._last_positions = []      # v9.0: last known-good broker positions
         self._consecutive_errors = 0   # v9.0: cycle exception streak
+        self._stop_submitted: Dict[str, datetime] = {}  # v9.2: stop-event dedupe (see STOP_RESUBMIT_SEC)
         self._load_state()
 
         # v8.5 (P1-3): startup reconciliation - cancel orphaned orders from a
@@ -3321,6 +3329,10 @@ class IntradayMonitor:
     # BUG-002 FIX: Independent ifs, highest priority first (same as BacktestEngine)
     def check_stops(self, positions: List[Dict]) -> int:
         triggered = 0
+        # v9.2: drop stop-dedupe marks from previous days
+        _today = now_et().date()
+        for _s in [s for s, t in self._stop_submitted.items() if t.date() != _today]:
+            del self._stop_submitted[_s]
         for p in positions:
             sym = p['symbol']
             if sym == self.config.HEDGE_ETF:
@@ -3358,11 +3370,24 @@ class IntradayMonitor:
                     stop, reason = True, 'trailing_50'
             
             if stop:
+                # v9.2 dedupe: same stop event already submitted within
+                # STOP_RESUBMIT_SEC -> position list is just lagging the
+                # fill; log and skip (no duplicate order, no duplicate
+                # Telegram). Past the window with the position still
+                # present, fall through and retry the sell.
+                _now = now_et()
+                _prev = self._stop_submitted.get(sym)
+                if (_prev is not None and _prev.date() == _now.date()
+                        and (_now - _prev).total_seconds() < self.config.STOP_RESUBMIT_SEC):
+                    logger.info(f"STOP {sym}: sell submitted {int((_now - _prev).total_seconds())}s ago, "
+                                f"awaiting broker sync - skipping duplicate")
+                    continue
                 logger.warning(f"STOP: {sym} P&L={pnl_pct:.1%} {reason}")
                 self.notifier.send(f"📉 止损触发: {sym} P&L {pnl_pct:+.1%} ({reason})，卖出 {qty} 股",
                                    key=f'stop_{sym}', min_interval=0)
                 order = self.client.submit_order(sym, qty, 'sell')
                 if order and order.get('status') in ('filled', 'accepted', 'new'):
+                    self._stop_submitted[sym] = _now
                     triggered += 1
                 else:
                     logger.error(f"Stop sell {sym} failed: {order}")
