@@ -1,0 +1,176 @@
+{
+ "limit_3pct": {
+  "total_return": 559.6,
+  "cagr": 40.7,
+  "sharpe": 1.59,
+  "mdd": -22.8,
+  "excess": 464.0,
+  "daily_limit_events": 33,
+  "sell_reasons": {
+   "hard_stop": 60,
+   "rebalance": 364,
+   "rebalance_trim": 138,
+   "risk_daily_loss_limit": 160,
+   "risk_max_drawdown": 34
+  },
+  "yearly": {
+   "2021": 42.1,
+   "2022": 3.8,
+   "2023": 41.9,
+   "2024": 89.8,
+   "2025": 23.9,
+   "2026": 30.7
+  },
+  "seg_2020_2023": 110.8,
+  "seg_2024_2026": 214.0
+ },
+ "limit_2pct": {
+  "total_return": 280.3,
+  "cagr": 27.4,
+  "sharpe": 1.23,
+  "mdd": -26.5,
+  "excess": 184.7,
+  "daily_limit_events": 75,
+  "sell_reasons": {
+   "hard_stop": 47,
+   "risk_daily_loss_limit": 405,
+   "rebalance": 301,
+   "rebalance_trim": 103,
+   "risk_max_drawdown": 47
+  },
+  "yearly": {
+   "2021": 14.8,
+   "2022": 2.3,
+   "2023": 15.4,
+   "2024": 113.8,
+   "2025": 5.9,
+   "2026": 22.2
+  },
+  "seg_2020_2023": 35.3,
+  "seg_2024_2026": 181.9
+ },
+ "limit_2_5pct": {
+  "total_return": 339.7,
+  "cagr": 30.7,
+  "sharpe": 1.3,
+  "mdd": -22.4,
+  "excess": 244.1,
+  "daily_limit_events": 49,
+  "sell_reasons": {
+   "hard_stop": 59,
+   "risk_daily_loss_limit": 254,
+   "rebalance": 328,
+   "rebalance_trim": 122,
+   "risk_max_drawdown": 39
+  },
+  "yearly": {
+   "2021": 28.8,
+   "2022": 4.4,
+   "2023": 13.1,
+   "2024": 82.4,
+   "2025": 24.7,
+   "2026": 25.4
+  },
+  "seg_2020_2023": 51.4,
+  "seg_2024_2026": 191.4
+ },
+ "limit_3_5pct": {
+  "total_return": 135.2,
+  "cagr": 16.7,
+  "sharpe": 0.79,
+  "mdd": -24.8,
+  "excess": 39.6,
+  "daily_limit_events": 23,
+  "sell_reasons": {
+   "hard_stop": 67,
+   "rebalance": 362,
+   "rebalance_trim": 134,
+   "risk_max_drawdown": 66,
+   "risk_daily_loss_limit": 113
+  },
+  "yearly": {
+   "2021": 2.0,
+   "2022": 10.5,
+   "2023": 21.9,
+   "2024": 27.0,
+   "2025": 5.9,
+   "2026": 27.7
+  },
+  "seg_2020_2023": 37.3,
+  "seg_2024_2026": 74.9
+ },
+ "limit_4pct": {
+  "total_return": 183.4,
+  "cagr": 20.8,
+  "sharpe": 0.92,
+  "mdd": -26.2,
+  "excess": 87.8,
+  "daily_limit_events": 15,
+  "sell_reasons": {
+   "hard_stop": 79,
+   "rebalance": 384,
+   "rebalance_trim": 139,
+   "risk_max_drawdown": 66,
+   "risk_daily_loss_limit": 70
+  },
+  "yearly": {
+   "2021": -2.6,
+   "2022": -3.7,
+   "2023": 43.1,
+   "2024": 40.1,
+   "2025": 21.6,
+   "2026": 24.5
+  },
+  "seg_2020_2023": 33.7,
+  "seg_2024_2026": 116.3
+ },
+ "limit_5pct": {
+  "total_return": 242.4,
+  "cagr": 25.0,
+  "sharpe": 1.06,
+  "mdd": -26.0,
+  "excess": 146.8,
+  "daily_limit_events": 6,
+  "sell_reasons": {
+   "hard_stop": 84,
+   "rebalance": 377,
+   "rebalance_trim": 148,
+   "risk_max_drawdown": 71,
+   "risk_daily_loss_limit": 28
+  },
+  "yearly": {
+   "2021": -0.3,
+   "2022": -3.3,
+   "2023": 43.2,
+   "2024": 62.8,
+   "2025": 31.9,
+   "2026": 15.2
+  },
+  "seg_2020_2023": 37.6,
+  "seg_2024_2026": 154.1
+ },
+ "limit_10pct": {
+  "total_return": 269.2,
+  "cagr": 26.7,
+  "sharpe": 1.12,
+  "mdd": -30.4,
+  "excess": 173.6,
+  "daily_limit_events": 0,
+  "sell_reasons": {
+   "hard_stop": 91,
+   "rebalance": 397,
+   "rebalance_trim": 141,
+   "risk_max_drawdown": 73
+  },
+  "yearly": {
+   "2021": -0.3,
+   "2022": -3.3,
+   "2023": 40.2,
+   "2024": 96.6,
+   "2025": 2.4,
+   "2026": 33.8
+  },
+  "seg_2020_2023": 34.7,
+  "seg_2024_2026": 174.5
+ }
+}

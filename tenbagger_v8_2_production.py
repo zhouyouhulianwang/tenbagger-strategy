@@ -323,6 +323,11 @@ class Config:
     #                          in 6y - dead code kept for live safety net)
     #   remove drawdown     -> 505.8/1.50/-24.1  (value: +54pp; earns it in
     #                          crash regimes 2020-23: 110.8 vs 58.4 without)
+    # Threshold-scanned 2026-08-11 (daily_loss_threshold_experiments.py, full
+    # pool): -3% is a sharp global optimum - 2% 280.3/1.23, 2.5% 339.7/1.30,
+    # 3% 559.6/1.59/-22.8, 3.5% 135.2/0.79, 4% 183.4/0.92, 5% 242.4/1.06,
+    # 10% 269.2/1.12/-30.4 (= ablation no_daily exactly, 0 events). Every
+    # alternative loses 200-420pp; 10% is effectively OFF at portfolio level.
     DAILY_LOSS_LIMIT_PCT: float = -0.03     # Stop trading if down 3% today
     MAX_DRAWDOWN_LIMIT_PCT: float = -0.10   # Circuit breaker at -10%
     CIRCUIT_BREAKER_COOLDOWN_HOURS: int = 24
