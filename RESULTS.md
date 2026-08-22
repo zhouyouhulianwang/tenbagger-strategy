@@ -1,12 +1,62 @@
-# Measured Results (v8.2 → v8.6)
+# Measured Results (v8.2 → v9.2)
 
-> **Bottom line (updated 2026-07-30)**: over the extended window
-> **2020-01-10 → 2026-07-29**, the v8.6 full-pool strategy (growth sleeve
-> removed after a 21-experiment attribution battery) returns **+240.0% vs
-> SPY +95.6% (+144pp)**, Sharpe **1.20**, Max DD **-24.7%**, and beats SPY
-> in BOTH sub-periods (2020-23: +60.1% vs +25.5%; 2024-26: +116.8% vs
-> +56.7%). Numbers still carry survivorship bias (2026-era constituents)
-> and are an **overestimate** — see caveats.
+> **Bottom line (updated 2026-08-22)**: over the extended window
+> **2020-01-10 → 2026-07-29**, the current v9.2 full-pool strategy returns
+> **+559.6% vs SPY +92.6% (+467pp)**, Sharpe **1.59**, Max DD **-22.8%**,
+> winning all six calendar years (2021 +42.1, 2022 +3.8, 2023 +41.9,
+> 2024 +89.8, 2025 +23.9, 2026 YTD +30.7) and both sub-periods
+> (2020-23: +110.8%; 2024-26: +214.0%). Baseline reproduced exactly 9x
+> across data rebuilds. Numbers still carry survivorship bias (2026-era
+> constituents) and are an **overestimate** — see caveats.
+
+## v8.9 → v9.2: experiment battery & live operations (2026-07-31 → 2026-08-22)
+
+**v8.9 (approved 2026-07-31): regime position-factor removed (pf=1.0).**
+Full investment beat every de-grossing variant: +559.6%/1.59/-22.8% vs
+v8.8 +335.7%/1.34/-23.0%, winning ALL six years incl. 2022 (+3.8% vs
+-2.6%). Real risk control lives in selection + stops, not exposure cuts.
+(Regime detection still drives sleeve weights; only the blunt scalar went.)
+
+Every subsequent proposal was tested as a single-bit change against this
+base (559.6/1.59/-22.8). Full JSONs in `data/`, config comments carry the
+same verdicts inline:
+
+| Experiment | Result vs base | Verdict |
+|---|---|---|
+| Risk ablation: remove daily-loss limit | 269.2/1.12/-30.4 (-290pp) | **daily limit = TOP defender, keep** |
+| Risk ablation: remove stops | 385.6/1.36/-26.1 (-174pp; trailing 50/100 fired ZERO times in 6y = dead code) | keep hard -8% |
+| Risk ablation: remove drawdown breaker | 505.8/1.50/-24.1 (-54pp; 2020-23 seg 58.4 vs 110.8) | keep (crash insurance) |
+| Stall-swap (replace stalling leaders) | filter 167.9/0.92, swap 270.2/1.15 | **REJECTED** (reversal penalty) |
+| Exhaustion overlays (external research) | leader 279.3/1.23, breadth 496.7/1.52 (fails seg), combo 200.2/1.04 | **REJECTED** (their 2022 signal inverts here) |
+| Volume floor 10M ADV | adv20 93.9/0.72, day 133.8/0.91; 5/6 holdings filtered, MDD unchanged | **REJECTED** (liquidity is a non-issue at $30K positions) |
+| Risk-liquidation re-entry timing | next_day 464.3/1.43/**-33.7** (breaker re-triggers 34→51), cooldown_2d 374.4/1.35 | **REJECTED** - the post-event idle window is protective |
+| Daily-loss threshold scan | 2% 280.3 / 2.5% 339.7 / **3% 559.6** / 3.5% 135.2 / 4% 183.4 / 5% 242.4 / 10% 269.2 (=OFF, 0 events) | **-3% is a sharp global optimum, keep** |
+
+**Live incidents that shaped v9.x** (paper account started 2026-07-24,
+$100K): Telegram notification stack (pre/post rebalance reports with full
+ranking + sizing detail, per-fill fills, [AL 2] prefix, rate-limiting);
+`last_rebalance` stamp-loss bug (caused PANW↔DVA churn round-trips and
+notification floods — fixed); stop-event dedupe (DVA notified 4x in 4 min
+on 2026-08-05 — fixed with 300s window + retry); Monday rebalance anchor
+(REBALANCE_WEEKDAY=0; the backtest engine stays weekday-agnostic at 5-day
+cycles); startup-notification accuracy (VERSION constant + dynamic weekday).
+
+**2026-08-05 live stress test**: DVA gapped -17% on earnings; hard stops
+fired, the -3% daily-loss limit emergency-liquidated the remaining 4
+positions (all succeeded). Post-hoc: DDOG — one of the liquidated names —
+crashed -19% on its own earnings the NEXT day; the limit saved ~$3.5K.
+The backtest's top-rated defense worked exactly as measured.
+
+**Data-pipeline fixes (2026-08-22 review)**: the weekly PIT rebuild
+silently dropped BRK.B/BF.B (dot-ticker vs SEC's dashed form) and XOM
+(SEC maps XOM to a holdco CIK with no us-gaap facts; real filer = legacy
+34088); APA/RF/SYF/TFC produced zero snaps (no standard revenue tag -
+banks need InterestIncomeExpenseNet+NoninterestIncome, holdco APA needs
+OperatingIncomeLoss+OperatingExpenses). All fixed in
+`build_pit_fundamentals.py` with a post-build regression guard (exit 2 if
+any of the 7 recovered symbols goes missing again). Rebuilt 509-symbol PIT
+validated: baseline reproduces 559.6/1.59/-22.8 **exactly** — pure
+data-completeness fix, zero selection drift.
 
 ## v8.6: strategy attribution & ablation battery (2026-07-30)
 

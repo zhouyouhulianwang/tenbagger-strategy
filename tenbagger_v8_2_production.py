@@ -165,10 +165,23 @@ root_logger = logging.getLogger('tenbagger')
 root_logger.setLevel(logging.DEBUG)
 root_logger.propagate = False
 
+
+class ETFormatter(logging.Formatter):
+    """v9.2: render every log timestamp in US/Eastern (market time),
+    regardless of server TZ. The server runs CST (= ET+12h) and mixed
+    CST/ET logs already caused one misdiagnosis (the 2026-08 'phantom
+    restart'). Affected: console + trading.log. trades.jsonl carries its
+    own ET timestamps inside the JSON and is intentionally untouched."""
+
+    def formatTime(self, record, datefmt=None):
+        dt = datetime.fromtimestamp(record.created, tz=ET)
+        return dt.strftime(datefmt) if datefmt else dt.strftime('%Y-%m-%d %H:%M:%S')
+
+
 # Console handler
 console = logging.StreamHandler()
 console.setLevel(logging.INFO)
-console.setFormatter(logging.Formatter(
+console.setFormatter(ETFormatter(
     '%(asctime)s | %(levelname)-8s | %(message)s',
     datefmt='%H:%M:%S'
 ))
@@ -179,7 +192,7 @@ file_handler = logging.handlers.TimedRotatingFileHandler(
     LOG_DIR / 'trading.log', when='midnight', backupCount=30, encoding='utf-8'
 )
 file_handler.setLevel(logging.DEBUG)
-file_handler.setFormatter(logging.Formatter(
+file_handler.setFormatter(ETFormatter(
     '%(asctime)s | %(levelname)-8s | %(name)s | %(filename)s:%(lineno)d | %(message)s'
 ))
 root_logger.addHandler(file_handler)
@@ -3560,6 +3573,15 @@ class IntradayMonitor:
                 return
             equity = float(acct['equity'])
             current_symbols = {p['symbol'] for p in current_positions}
+            # v9.2: previous-rebalance equity for the post-report weekly SPY
+            # comparison - must be captured BEFORE the stamp block below
+            # overwrites equity_at_last_rebalance with today's value.
+            self._prev_rebalance_equity = None
+            try:
+                with open(self.config.STATE_FILE) as _f:
+                    self._prev_rebalance_equity = json.load(_f).get('equity_at_last_rebalance')
+            except Exception:
+                pass
             
             # Stock equity: hedge compression + regime position factor
             # (v8.3: v8.2 ignored the regime factor -> stayed ~100% invested
@@ -3744,6 +3766,13 @@ class IntradayMonitor:
                     with open(self.config.STATE_FILE) as f:
                         data = json.load(f)
                     data['last_rebalance'] = now_et().isoformat()
+                    # v9.2: equity baseline for next week's SPY comparison
+                    try:
+                        _acct = self.client.get_account()
+                        if _acct:
+                            data['equity_at_last_rebalance'] = float(_acct['equity'])
+                    except Exception:
+                        pass
                     tmp = self.config.STATE_FILE.with_suffix('.tmp')
                     with open(tmp, 'w') as f:
                         json.dump(data, f, indent=2)
@@ -3771,6 +3800,28 @@ class IntradayMonitor:
                     if acct_now:
                         post_lines.append(f"equity ${float(acct_now['equity']):,.0f} | "
                                           f"cash ${float(acct_now['cash']):,.0f}")
+                    # v9.2 (user request 2026-08-22): benchmark comparison in
+                    # every post-rebalance report - weekly delta vs equity at
+                    # previous rebalance (persisted in state.json), and
+                    # since-inception vs SPY (paper account started
+                    # 2026-07-24 at INITIAL_CAPITAL).
+                    try:
+                        spy = prices['SPY'].dropna() if 'SPY' in prices.columns else None
+                        prev_eq = getattr(self, '_prev_rebalance_equity', None)
+                        if prev_eq and spy is not None and len(spy) > 6:
+                            wk_s = eq_now / prev_eq - 1
+                            wk_spy = spy.iloc[-1] / spy.iloc[-6] - 1
+                            post_lines.append(
+                                f"近1周: 策略 {wk_s:+.1%} | SPY {wk_spy:+.1%}")
+                        tot_s = eq_now / self.config.INITIAL_CAPITAL - 1
+                        if spy is not None:
+                            spy0 = spy[spy.index <= '2026-07-24']
+                            if len(spy0):
+                                tot_spy = spy.iloc[-1] / spy0.iloc[-1] - 1
+                                post_lines.append(
+                                    f"累计(7/24起): 策略 {tot_s:+.1%} | SPY {tot_spy:+.1%}")
+                    except Exception as _e:
+                        logger.warning(f"benchmark comparison failed: {_e}")
                 except Exception:
                     post_lines.append(f"equity ${equity:,.0f}（成交前读数）")
                 self.notifier.send('\n'.join(post_lines),

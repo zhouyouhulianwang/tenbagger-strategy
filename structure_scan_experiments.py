@@ -83,13 +83,24 @@ def main():
             continue
         results.setdefault(group, {})
         for name, cfg in variants:
+            if name in results.get(group, {}):
+                print(f'skip {group}/{name} (already done)', flush=True)
+                continue
             print(f'running {group}/{name} ...', flush=True)
-            results[group][name] = run_one(cfg, prices, benchmark, vix, fundamentals)
-            r = results[group][name]
+            r = run_one(cfg, prices, benchmark, vix, fundamentals)
             print(f"  {group}/{name}: ret {r['total_return']}% sharpe {r['sharpe']} "
                   f"mdd {r['mdd']}% segs {r['seg_2020_2023']}/{r['seg_2024_2026']}",
                   flush=True)
-            json.dump(results, open(OUT, 'w'), indent=1)
+            # merge-on-dump: concurrent group processes each own one group
+            # key; re-load the file and update only ours so we never wipe
+            # another group's results (lost ~12min of compute to this race
+            # on 2026-08-22 before the fix).
+            try:
+                disk = json.load(open(OUT))
+            except Exception:
+                disk = {}
+            disk.setdefault(group, {})[name] = r
+            json.dump(disk, open(OUT, 'w'), indent=1)
     print('done ->', OUT)
 
 
