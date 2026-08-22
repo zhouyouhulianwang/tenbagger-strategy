@@ -76,6 +76,27 @@ def run_one(cfg, prices, benchmark, vix, fundamentals):
 def main():
     which = sys.argv[1] if len(sys.argv) > 1 else 'all'
     print(f'loading data... group={which}', flush=True)
+    # 2026-08-22: the sandbox mount flipped files mid-session and silently
+    # changed backtest inputs between runs (same config -> 559.6 vs 432.6).
+    # Hash every input file at load time and stamp it into each result so
+    # cross-run comparability is verifiable, not assumed.
+    import hashlib
+    def _h(p):
+        try:
+            return hashlib.md5(open(p, 'rb').read()).hexdigest()[:12]
+        except Exception:
+            return 'NA'
+    pit_hash = _h(os.path.join(DATA, 'pit_fundamentals_full.json'))
+    uni_dir = os.path.join(DATA, 'universe')
+    import glob as _g
+    uni_hash = hashlib.md5(''.join(
+        f"{os.path.basename(f)}:{os.path.getsize(f)}:{int(os.path.getmtime(f))};"
+        for f in sorted(_g.glob(os.path.join(uni_dir, '*.csv')))).encode()).hexdigest()[:12]
+    spy_hash = _h(os.path.join(DATA, 'spy_2021_2023_v2.csv'))
+    sqqq_hash = _h(os.path.join(DATA, 'sqqq.csv'))
+    vix_hash = _h(os.path.join(DATA, 'vix.csv'))
+    print(f'INPUT HASHES: pit={pit_hash} universe={uni_hash} '
+          f'spy={spy_hash} sqqq={sqqq_hash} vix={vix_hash}', flush=True)
     prices, benchmark, vix, fundamentals = load_data()
     results = json.load(open(OUT)) if os.path.exists(OUT) else {}
     for group, variants in GROUPS.items():
@@ -88,6 +109,7 @@ def main():
                 continue
             print(f'running {group}/{name} ...', flush=True)
             r = run_one(cfg, prices, benchmark, vix, fundamentals)
+            r['input_hash'] = f'pit={pit_hash},uni={uni_hash},spy={spy_hash}'
             print(f"  {group}/{name}: ret {r['total_return']}% sharpe {r['sharpe']} "
                   f"mdd {r['mdd']}% segs {r['seg_2020_2023']}/{r['seg_2024_2026']}",
                   flush=True)

@@ -227,7 +227,12 @@ class Config:
     """Production configuration - all parameters in one place."""
     
     # === General ===
-    VERSION: str = 'v9.2'
+    # v9.3 (2026-08-22, approved via full-review "全部"): live sizing aligned
+    # to the backtest engine (vol x score weights + 30% cap + 5% min + 25%
+    # drift band; was equal weight - never backtested). Evidence: v3 data
+    # vol_score 432.6/1.41/-30.3 vs equal 310.5/1.31/-21.0.
+    # v9.2: Monday rebalance, stamp fix, report trio, experiment archive.
+    VERSION: str = 'v9.3'
     INITIAL_CAPITAL: float = 100_000.0
     MAX_POSITIONS: int = 6
     REBALANCE_DAYS: int = 5  # Weekly
@@ -1658,25 +1663,79 @@ class FailSafeRebalancer:
         return True, "OK"
     
     def smart_rebalance(self, prices: pd.DataFrame, current_symbols: set,
-                        new_signals: List[str], equity: float) -> Dict[str, int]:
-        """Smart rebalance: keep overlapping, only trade deltas."""
+                        new_signals: List[str], equity: float,
+                        combined: Dict[str, Dict] = None, t: int = None,
+                        current_qty: Dict[str, int] = None) -> Dict[str, int]:
+        """Smart rebalance: keep overlapping, only trade deltas.
+
+        v9.3 sizing alignment: when combined+t are provided, size positions
+        with the backtest engine's inline vol x score weighting (raw_w =
+        min(VOLATILITY_TARGET/vol, 2) x min(total/0.5, 1), defensive vol
+        x0.8; normalized over equity; 30% cap; 5% min; 25%-of-target drift
+        band on existing positions via current_qty) instead of flat equal
+        weight. Evidence (structure_scan_experiments.py, v3 509-symbol
+        data): vol_score 432.6/1.41/-30.3 vs equal 310.5/1.31/-21.0. The
+        2026-08-22 review found live was running equal weight - a sizing
+        that had never been backtested - while the archived backtest
+        numbers came from vol x score. This aligns live to the measured-
+        better, actually-backtested sizing. Falls back to equal weight when
+        combined/t are absent.
+        """
         new_set = set(new_signals)
         keep = current_symbols & new_set
         sell = current_symbols - new_set
         buy = new_set - current_symbols
-        
+
         logger.info(f"Smart rebalance: keep={len(keep)} sell={len(sell)} buy={len(buy)}")
         logger.info(f"  Keep: {sorted(keep)}, Sell: {sorted(sell)}, Buy: {sorted(buy)}")
-        
-        capital_per = equity / len(new_signals) if new_signals else 0
+
+        # --- target dollar values per symbol ---
+        target_vals = {}
+        raw_w = {}
+        if combined is not None and t is not None:
+            for sym in new_signals:
+                if sym not in prices.columns:
+                    continue
+                if t >= 20:
+                    vol = prices[sym].iloc[max(0, t - 20):t + 1].pct_change().std() * np.sqrt(252)
+                else:
+                    vol = 0.30
+                sig = combined.get(sym, {})
+                if 'defensive' in sig.get('strategies', []):
+                    vol *= 0.8
+                vol_factor = min(self.config.VOLATILITY_TARGET / vol, 2.0) if vol > 0 else 1.0
+                score_weight = min(sig.get('total', 0) / 0.5, 1.0) if sig.get('total', 0) > 0 else 0.5
+                raw_w[sym] = vol_factor * score_weight
+        wsum = sum(raw_w.values())
+        if raw_w and wsum > 0:
+            for sym, w in raw_w.items():
+                tv = equity * w / wsum
+                tv = min(tv, equity * self.config.MAX_SINGLE_POSITION_PCT)
+                if tv >= equity * self.config.MIN_SINGLE_POSITION_PCT:
+                    target_vals[sym] = tv
+            logger.info("Sizing: vol x score weights (backtest-aligned): "
+                        + ', '.join(f"{s} {v / equity:.1%}" for s, v in target_vals.items()))
+        else:
+            capital_per = equity / len(new_signals) if new_signals else 0
+            for sym in new_signals:
+                target_vals[sym] = capital_per
+            logger.info("Sizing: equal weight (fallback)")
+
         target = {}
-        for sym in new_signals:
-            if sym in prices.columns:
-                price = prices[sym].iloc[-1]
-                if price > 0:
-                    qty = int(capital_per / price)
-                    if qty > 0:
-                        target[sym] = qty
+        current_qty = current_qty or {}
+        for sym, tv in target_vals.items():
+            price = prices[sym].iloc[-1]
+            if price <= 0:
+                continue
+            cq = current_qty.get(sym, 0)
+            if cq > 0 and abs(cq * price - tv) / tv < 0.25:
+                # 25%-of-target drift band (backtest parity): close enough,
+                # keep current shares - avoids churn top-ups/trims.
+                target[sym] = cq
+                continue
+            qty = int(tv / price)
+            if qty > 0:
+                target[sym] = qty
         return target
 
 
@@ -2044,26 +2103,26 @@ class PortfolioConstructor:
             
             price = current_prices[sym]
 
-            if self.config.SIZING_MODE == 'equal':
-                # v9.2 experiment: what live smart_rebalance() actually does
-                target_value = capital / self.config.MAX_POSITIONS
+            # NOTE (v9.2): this method is DEAD CODE - BacktestEngine.run()
+            # sizes positions inline (~line 2900: raw_w = vol_factor x
+            # score_weight, normalized). Kept for reference only; SIZING_MODE
+            # and any sizing experiments act on the inline code, not here.
+            # Volatility-based sizing
+            if t >= 20:
+                vol = prices[sym].iloc[max(0, t-20):t+1].pct_change().std() * np.sqrt(252)
             else:
-                # Volatility-based sizing ('vol_score', current production)
-                if t >= 20:
-                    vol = prices[sym].iloc[max(0, t-20):t+1].pct_change().std() * np.sqrt(252)
-                else:
-                    vol = 0.30
+                vol = 0.30
 
-                if 'defensive' in signal.get('strategies', []):
-                    vol *= 0.8
+            if 'defensive' in signal.get('strategies', []):
+                vol *= 0.8
 
-                vol_factor = min(self.config.VOLATILITY_TARGET / vol, 2.0) if vol > 0 else 1.0
-                score_weight = min(signal['total'] / 0.5, 1.0) if signal['total'] > 0 else 0.5
+            vol_factor = min(self.config.VOLATILITY_TARGET / vol, 2.0) if vol > 0 else 1.0
+            score_weight = min(signal['total'] / 0.5, 1.0) if signal['total'] > 0 else 0.5
 
-                target_value = capital * vol_factor * score_weight / self.config.MAX_POSITIONS
-                max_val = capital * self.config.MAX_SINGLE_POSITION_PCT
-                min_val = capital * self.config.MIN_SINGLE_POSITION_PCT
-                target_value = max(min(target_value, max_val), min_val)
+            target_value = capital * vol_factor * score_weight / self.config.MAX_POSITIONS
+            max_val = capital * self.config.MAX_SINGLE_POSITION_PCT
+            min_val = capital * self.config.MIN_SINGLE_POSITION_PCT
+            target_value = max(min(target_value, max_val), min_val)
             
             qty = int(target_value / price)
             if qty > 0:
@@ -2897,9 +2956,14 @@ class BacktestEngine:
                         continue
                     if 'defensive' in signal.get('strategies', []):
                         vol *= 0.8
-                    vol_factor = min(self.config.VOLATILITY_TARGET / vol, 2.0) if vol > 0 else 1.0
-                    score_weight = min(signal['total'] / 0.5, 1.0) if signal['total'] > 0 else 0.5
-                    raw_w[sym] = vol_factor * score_weight
+                    # v9.2 SIZING_MODE experiment: 'equal' = what live
+                    # smart_rebalance() actually does (adjusted_capital/N).
+                    if self.config.SIZING_MODE == 'equal':
+                        raw_w[sym] = 1.0
+                    else:
+                        vol_factor = min(self.config.VOLATILITY_TARGET / vol, 2.0) if vol > 0 else 1.0
+                        score_weight = min(signal['total'] / 0.5, 1.0) if signal['total'] > 0 else 0.5
+                        raw_w[sym] = vol_factor * score_weight
 
                 wsum = sum(raw_w.values())
                 targets = {}
@@ -3588,7 +3652,13 @@ class IntradayMonitor:
             # even in PANIC, while the backtest de-risked to 40%)
             stock_equity = (equity * self.hedge.get_stock_compression()
                             * msignal.get('position_factor', 1.0))
-            target = self.rebalancer.smart_rebalance(prices, current_symbols, signals, stock_equity)
+            # v9.3: pass combined signals + t + current quantities so live
+            # sizing uses the backtest's vol x score weights and drift band
+            target = self.rebalancer.smart_rebalance(
+                prices, current_symbols, signals, stock_equity,
+                combined=combined, t=t,
+                current_qty={p['symbol']: int(float(p['qty']))
+                             for p in current_positions})
 
             # === v9.2 (user standing rule 2026-08-03): PRE-rebalance report
             # via Telegram BEFORE any order is sent. Includes the full
@@ -3624,12 +3694,14 @@ class IntradayMonitor:
                     mark = '  ← 落选'
                 rank_lines.append(f"{i}. {sym} 总分{d['total']:.3f} [{' '.join(parts)}]{mark}")
 
-            # --- weight calculation process (equal-weight: stock_equity / N) ---
+            # --- weight calculation process (v9.3: vol x score sizing,
+            # aligned with the backtest engine; 25% drift band on keeps) ---
             pf = msignal.get('position_factor', 1.0)
             comp = self.hedge.get_stock_compression()
-            per = stock_equity / len(signals) if signals else 0
             calc_lines = [f"权重计算: ${equity:,.0f} × pf={pf:.2f} × 压缩={comp:.2f}"
-                          f" = ${stock_equity:,.0f} ÷ {len(signals)}票 = ${per:,.0f}/票"]
+                          f" = ${stock_equity:,.0f}，按 vol×score 加权分配"
+                          f"（单票上限{self.config.MAX_SINGLE_POSITION_PCT:.0%}，"
+                          f"漂移带±25%）"]
             for sym, qty in target.items():
                 px = float(prices[sym].iloc[-1])
                 calc_lines.append(f"  {sym} {qty}股 @${px:,.2f} → {qty * px / equity:.1%}")
