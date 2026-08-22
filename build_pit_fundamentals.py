@@ -298,6 +298,26 @@ def main():
     tickers_json = sec_json('https://www.sec.gov/files/company_tickers.json', tick_path)
     cik_of = {v['ticker'].upper(): v['cik_str'] for v in tickers_json.values()}
 
+    # 2026-08-22 fixes (weekly cron rebuild on 08-08 and 08-22 silently
+    # dropped symbols - the 08-08 regression broke baseline reproducibility
+    # until patched by hand):
+    #  1) dot-tickers: our universe uses BRK.B/BF.B but SEC's ticker file
+    #     uses dashes (BRK-B/BF-B) -> look up the dashed form.
+    #  2) CIK overrides: SEC maps some listed tickers to holding entities
+    #     whose companyfacts carry no us-gaap financials, while the actual
+    #     filer is the legacy operating entity:
+    #       XOM -> 2115436 'ExxonMobil Holdings Corp' (ffd-only facts);
+    #              real filer Exxon Mobil Corp 34088 (current thru 2026-03).
+    CIK_OVERRIDE = {'XOM': 34088}
+
+    def resolve_cik(sym):
+        if sym in CIK_OVERRIDE:
+            return CIK_OVERRIDE[sym]
+        if sym in cik_of:
+            return cik_of[sym]
+        dashed = sym.replace('.', '-')
+        return cik_of.get(dashed)
+
     if len(sys.argv) > 1:
         tickers = [l.strip() for l in open(sys.argv[1]) if l.strip()]
     else:
@@ -312,16 +332,17 @@ def main():
     t0 = time.time()
     for i, sym in enumerate(tickers):
         try:
-            if sym not in cik_of:
+            cik = resolve_cik(sym)
+            if cik is None:
                 fails.append((sym, 'no_cik'))
                 continue
-            snaps = build_pit(sym, cik_of)
+            snaps = build_pit(sym, {sym: cik})
             if snaps:
                 pit[sym] = snaps
             else:
                 fails.append((sym, 'no_snaps'))
-            sub = sec_json(f'https://data.sec.gov/submissions/CIK{cik_of[sym]:010d}.json',
-                           f'{CACHE}/sub_{cik_of[sym]}.json')
+            sub = sec_json(f'https://data.sec.gov/submissions/CIK{cik:010d}.json',
+                           f'{CACHE}/sub_{cik}.json')
             sectors[sym] = sic_to_sector((sub or {}).get('sic'))
             time.sleep(0.12)
         except Exception as ex:
@@ -338,6 +359,14 @@ def main():
         json.dump(out, f)
     print(f"DONE {(time.time()-t0)/60:.1f}min ok={len(pit)} fail={len(fails)} -> {out_json}")
     print("fails:", fails)
+    # 2026-08-22: regression guard - these symbols were silently dropped by
+    # the 08-08/08-22 rebuilds (dot-ticker no_cik / holdco CIK). If they go
+    # missing again, FAIL LOUDLY so the weekly cron log shows it.
+    REQUIRED = ['BRK.B', 'BF.B', 'XOM']
+    missing = [s for s in REQUIRED if s not in pit]
+    if missing:
+        print(f"*** REGRESSION GUARD: required symbols missing: {missing} ***")
+        sys.exit(2)
 
 
 if __name__ == '__main__':
