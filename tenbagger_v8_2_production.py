@@ -234,7 +234,17 @@ class Config:
     # v9.2: Monday rebalance, stamp fix, report trio, experiment archive.
     VERSION: str = 'v9.3'
     INITIAL_CAPITAL: float = 100_000.0
+    # Scanned 2026-08-22 (structure_scan_experiments.py, v3 509-symbol data,
+    # base n6 432.6/1.41/-30.3): n5 486.8/1.42/-26.6 (headline +54pp but
+    # Sharpe +0.01 = noise, 2021 -23pp hole: 18.9 vs 42.1 - concentration
+    # variance, not edge), n7 233.3/1.15, n8 165.5/1.00, n10 182.1/1.09.
+    # Monotonic decay past 6 (dilution kills alpha). KEEP 6.
     MAX_POSITIONS: int = 6
+    # Cycle-anchor phase scanned 2026-08-22 (t=252 = 2021-01-11 = a Monday,
+    # so p0 ~= Monday, matching live REBALANCE_WEEKDAY=0): p0 432.6/1.41,
+    # p1 464.8/1.46, p2 333.7/1.26, p3 332.6/1.26, p4 344.8/1.29. Mon/Tue
+    # clearly beat Wed-Fri in 2020-23 (91/103 vs ~56-60), identical 2024-26.
+    # Monday is already near-optimal; p1's +32pp is best-of-5 noise. KEEP.
     REBALANCE_DAYS: int = 5  # Weekly
     # Live weekly rebalance anchor (Python weekday: 0=Mon ... 4=Fri).
     # User directive 2026-08-03: Friday -> Monday. Note: the backtest engine

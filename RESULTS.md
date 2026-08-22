@@ -1,13 +1,29 @@
-# Measured Results (v8.2 → v9.2)
+# Measured Results (v8.2 → v9.3)
 
-> **Bottom line (updated 2026-08-22)**: over the extended window
-> **2020-01-10 → 2026-07-29**, the current v9.2 full-pool strategy returns
-> **+559.6% vs SPY +92.6% (+467pp)**, Sharpe **1.59**, Max DD **-22.8%**,
-> winning all six calendar years (2021 +42.1, 2022 +3.8, 2023 +41.9,
-> 2024 +89.8, 2025 +23.9, 2026 YTD +30.7) and both sub-periods
-> (2020-23: +110.8%; 2024-26: +214.0%). Baseline reproduced exactly 9x
-> across data rebuilds. Numbers still carry survivorship bias (2026-era
-> constituents) and are an **overestimate** — see caveats.
+> **Bottom line (updated 2026-08-22, v3 data)**: over the extended window
+> **2020-01-10 → 2026-07-29**, the current v9.3 full-pool strategy returns
+> **+432.6% vs SPY +92.6% (+340pp)**, Sharpe **1.41**, Max DD **-30.3%**
+> (2021 +42.1, 2022 +5.5, 2023 +28.0, 2024 +88.3, 2025 +10.9, 2026 YTD
+> +31.2; segments 2020-23 +91.2% / 2024-26 +179.6%).
+>
+> **Data-lineage note**: the previously quoted **+559.6%/1.59/-22.8%** was
+> measured on PIT data that was *silently missing APA/RF/SYF/TFC* (SEC
+> holdco-CIK and bank-tag gaps in the weekly rebuild). Restoring them
+> (2026-08-22 build fixes) moves the base to +432.6% - the restored
+> regional banks enter value/defensive sleeves and lose in the 2023 SVB
+> crisis and 2025 (2023: +41.9 -> +28.0; 2025: +23.9 -> +10.9; 2022
+> improves +3.8 -> +5.5). +432.6% on complete data is the honest number;
+> all archived experiment verdicts remain valid (each was measured against
+> its own same-data base). Numbers still carry survivorship bias
+> (2026-era constituents) and are an **overestimate** — see caveats.
+
+## v9.3: structure scans (2026-08-22, v3 data, hash-stamped inputs)
+
+| Scan | Results (ret%/Sharpe/MDD%) | Verdict |
+|---|---|---|
+| Sizing: vol×score (backtest) vs equal (what live ran) | 432.6/1.41/-30.3 vs 310.5/1.31/-21.0 | **live aligned to vol×score in v9.3** — live had been running a sizing that was never backtested (allocate() was dead code; the engine sizes inline) |
+| MAX_POSITIONS = 5 / **6** / 7 / 8 / 10 | 486.8/1.42 · **432.6/1.41** · 233.3/1.15 · 165.5/1.00 · 182.1/1.09 | keep 6: n5's +54pp is Sharpe-noise (+0.01) with a -23pp 2021 hole (18.9 vs 42.1); past 6, dilution kills alpha |
+| Rebalance phase p0(≈Mon) / p1 / p2 / p3 / p4 | **432.6/1.41** · 464.8/1.46 · 333.7/1.26 · 332.6/1.26 · 344.8/1.29 | keep Monday: Mon/Tue ≫ Wed–Fri in 2020-23 (91/103 vs ~56-60), identical 2024-26; p1's +32pp is best-of-5 noise |
 
 ## v8.9 → v9.2: experiment battery & live operations (2026-07-31 → 2026-08-22)
 
