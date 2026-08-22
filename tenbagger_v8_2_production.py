@@ -349,6 +349,20 @@ class Config:
     # continuation days. KEEP 'scheduled'.
     RISK_REENTRY_MODE: str = 'scheduled'   # 'scheduled' | 'next_day' | 'cooldown_2d'
 
+    # === v9.2 structure experiments (2026-08-22 full review). Both are ===
+    # === BacktestEngine-ONLY; the live monitor ignores them. ===
+    # SIZING_MODE: how allocate() sizes positions in the backtest.
+    #   'vol_score' (current): capital/N x vol factor (VOLATILITY_TARGET/vol,
+    #     cap 2.0) x score weight (total/0.5, cap 1.0), clamped 5%-30%.
+    #   'equal': capital/N - which is what live smart_rebalance() ACTUALLY
+    #     does. Tested to quantify the live/backtest sizing gap.
+    SIZING_MODE: str = 'vol_score'         # 'vol_score' | 'equal'
+    # REBALANCE_PHASE: shift the first rebalance (hence the whole 5-day
+    #   cycle anchor) by N trading days. 0 = current (anchor = t=252).
+    #   Live uses a Monday anchor (REBALANCE_WEEKDAY); this tests whether
+    #   the anchor's phase within the week matters at all.
+    REBALANCE_PHASE: int = 0               # 0..4
+
     # === Pattern Day Trader (PDT) protection (v8.5) ===
     # FINRA: >=4 day trades in 5 business days with equity < $25k -> account
     # restricted for 90 days. We stop opening new positions / new hedge
@@ -2016,23 +2030,27 @@ class PortfolioConstructor:
                 continue
             
             price = current_prices[sym]
-            
-            # Volatility-based sizing
-            if t >= 20:
-                vol = prices[sym].iloc[max(0, t-20):t+1].pct_change().std() * np.sqrt(252)
+
+            if self.config.SIZING_MODE == 'equal':
+                # v9.2 experiment: what live smart_rebalance() actually does
+                target_value = capital / self.config.MAX_POSITIONS
             else:
-                vol = 0.30
-            
-            if 'defensive' in signal.get('strategies', []):
-                vol *= 0.8
-            
-            vol_factor = min(self.config.VOLATILITY_TARGET / vol, 2.0) if vol > 0 else 1.0
-            score_weight = min(signal['total'] / 0.5, 1.0) if signal['total'] > 0 else 0.5
-            
-            target_value = capital * vol_factor * score_weight / self.config.MAX_POSITIONS
-            max_val = capital * self.config.MAX_SINGLE_POSITION_PCT
-            min_val = capital * self.config.MIN_SINGLE_POSITION_PCT
-            target_value = max(min(target_value, max_val), min_val)
+                # Volatility-based sizing ('vol_score', current production)
+                if t >= 20:
+                    vol = prices[sym].iloc[max(0, t-20):t+1].pct_change().std() * np.sqrt(252)
+                else:
+                    vol = 0.30
+
+                if 'defensive' in signal.get('strategies', []):
+                    vol *= 0.8
+
+                vol_factor = min(self.config.VOLATILITY_TARGET / vol, 2.0) if vol > 0 else 1.0
+                score_weight = min(signal['total'] / 0.5, 1.0) if signal['total'] > 0 else 0.5
+
+                target_value = capital * vol_factor * score_weight / self.config.MAX_POSITIONS
+                max_val = capital * self.config.MAX_SINGLE_POSITION_PCT
+                min_val = capital * self.config.MIN_SINGLE_POSITION_PCT
+                target_value = max(min(target_value, max_val), min_val)
             
             qty = int(target_value / price)
             if qty > 0:
@@ -2546,7 +2564,10 @@ class BacktestEngine:
         max_prices_tracker = {}
 
         # HP-001 FIX: Reset _last_t at start of each backtest
-        self._last_t = 0
+        # v9.2: REBALANCE_PHASE shifts the first rebalance by N trading days
+        # (phase 0: _last_t=247 -> first trigger at t=252, identical to the
+        # old _last_t=0 behaviour and to every archived baseline).
+        self._last_t = 252 - self.config.REBALANCE_DAYS + self.config.REBALANCE_PHASE
 
         logger.info(f"Backtest: {n_days} days, next_day_open={use_next_day_open}, "
                     f"hedge={'on' if vix_aligned is not None else 'off'}")

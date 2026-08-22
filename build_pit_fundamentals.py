@@ -256,6 +256,26 @@ def build_pit(symbol, cik_of):
     rev_b = _merge_keys(gaap, BANK_REV)
     rev_items = rev_b if _q_coverage(rev_b) > _q_coverage(rev_a) else rev_a
     rev_ttm = _series_ttm(rev_items)
+    if not rev_ttm:
+        # 2026-08-22 fallback for issuers with no standard revenue tag
+        # (found via the full review: APA/RF/SYF/TFC produced zero snaps):
+        #  - banks (RF/SYF/TFC): revenue ~= InterestIncomeExpenseNet
+        #    + NoninterestIncome (both have clean quarterly + YTD items)
+        #  - holdcos without a revenue line (APA): revenue ~=
+        #    OperatingIncomeLoss + OperatingExpenses
+        # Component TTMs are summed at common period-ends; PIT availability
+        # = the later of the two components' filed dates.
+        for keys in (['InterestIncomeExpenseNet', 'NoninterestIncome'],
+                     ['OperatingIncomeLoss', 'OperatingExpenses']):
+            parts = [_series_ttm(_merge_keys(gaap, [k])) for k in keys]
+            if all(parts):
+                common = set(parts[0]) & set(parts[1])
+                rev_ttm = {e: {'end': e,
+                               'ttm': parts[0][e]['ttm'] + parts[1][e]['ttm'],
+                               'filed': max(parts[0][e]['filed'], parts[1][e]['filed'])}
+                           for e in common}
+                if rev_ttm:
+                    break
     ni_ttm = _series_ttm(_merge_keys(gaap, NI_KEYS))
     div_items = _merge_keys(gaap, DIV_KEYS)
     div_ttm = _series_ttm(div_items) if div_items else {}
@@ -362,7 +382,7 @@ def main():
     # 2026-08-22: regression guard - these symbols were silently dropped by
     # the 08-08/08-22 rebuilds (dot-ticker no_cik / holdco CIK). If they go
     # missing again, FAIL LOUDLY so the weekly cron log shows it.
-    REQUIRED = ['BRK.B', 'BF.B', 'XOM']
+    REQUIRED = ['BRK.B', 'BF.B', 'XOM', 'APA', 'RF', 'SYF', 'TFC']
     missing = [s for s in REQUIRED if s not in pit]
     if missing:
         print(f"*** REGRESSION GUARD: required symbols missing: {missing} ***")
