@@ -17,6 +17,23 @@
 > its own same-data base). Numbers still carry survivorship bias
 > (2026-era constituents) and are an **overestimate** — see caveats.
 
+## Live ops: pre-rebalance data freshness gate (rule #47, deployed 2026-08-24)
+
+User rule #47: before any rebalance, confirm the data is the latest; if not,
+pull fresh data first, then execute. Implemented in `do_rebalance()`:
+
+- **Prices**: latest bar must be today or the previous weekday (ET). If
+  stale → wait 20s and re-pull (max 2 retries); still stale → abort the
+  rebalance, Telegram alert (`stale_data_abort`), no `last_rebalance`
+  stamp so the next cycle retries automatically.
+- **PIT fundamentals**: file older than `PIT_MAX_AGE_DAYS=10` triggers an
+  inline rebuild via `build_pit_fundamentals.py` (600s timeout) + reload;
+  failure → abort + alert (`stale_pit_abort`). The Saturday cron normally
+  keeps age ≤7d; the gate is the backstop for cron failures.
+- Principle: 宁缺勿滥 — never generate signals from stale data; positions
+  stay untouched on abort. Simulation: 10/10 paths pass
+  (`test_freshness_gate.py`).
+
 ## v9.3: structure scans (2026-08-22, v3 data, hash-stamped inputs)
 
 | Scan | Results (ret%/Sharpe/MDD%) | Verdict |
