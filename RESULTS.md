@@ -17,13 +17,36 @@
 > its own same-data base). Numbers still carry survivorship bias
 > (2026-era constituents) and are an **overestimate** — see caveats.
 
+## Live ops: daily/weekly full reports (rule #50, deployed 2026-08-24)
+
+User rule #50: send a complete report every day and every week — rebalance
+activity, holdings, P&L. Implemented in `IntradayMonitor`:
+
+- **Daily** (every trading day, once, after 16:05 ET — detected via
+  "market was open today" + Alpaca clock): equity/cash, daily return
+  (vs Alpaca `last_equity`) vs SPY daily, cumulative since 2026-07-24
+  vs SPY (inception close cached in state), full holdings with
+  qty/price/P&L%/weight, and the day's fills.
+- **Weekly** (last trading day of the week — the clock's `next_open`
+  falling in the next ISO week, holiday-shortened weeks handled):
+  weekly return vs SPY, cumulative, the week's fills, holdings.
+- Every account change (rebalance fills, stop-loss sells, emergency
+  liquidation, hedge switches) is recorded to `trades_log` in
+  state.json and flows into both reports. State survives restarts.
+- Also fixed: `equity_at_last_rebalance` (weekly SPY baseline) was
+  being dropped by `_save_state` within a minute of each rebalance —
+  same bug class as the v9.2 `last_rebalance` stamp loss; now
+  preserved across saves.
+- Simulation: 15/15 paths pass (`test_periodic_reports.py`).
+
 ## Live ops: pre-rebalance data freshness gate (rule #47, deployed 2026-08-24)
 
 User rule #47: before any rebalance, confirm the data is the latest; if not,
-pull fresh data first, then execute. Implemented in `do_rebalance()`:
+pull fresh data first (max 3 retries per user spec 2026-08-24), then
+execute. Implemented in `do_rebalance()`:
 
 - **Prices**: latest bar must be today or the previous weekday (ET). If
-  stale → wait 20s and re-pull (max 2 retries); still stale → abort the
+  stale → wait 20s and re-pull (max 3 retries); still stale → abort the
   rebalance, Telegram alert (`stale_data_abort`), no `last_rebalance`
   stamp so the next cycle retries automatically.
 - **PIT fundamentals**: file older than `PIT_MAX_AGE_DAYS=10` triggers an

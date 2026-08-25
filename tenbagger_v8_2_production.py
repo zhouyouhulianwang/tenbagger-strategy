@@ -124,7 +124,7 @@ import getpass
 import pickle
 import functools
 from pathlib import Path
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, time as dt_time
 from zoneinfo import ZoneInfo
 from typing import Dict, List, Optional, Tuple, Any, Callable
 from dataclasses import dataclass, field, asdict
@@ -3346,6 +3346,14 @@ class IntradayMonitor:
         self._last_positions = []      # v9.0: last known-good broker positions
         self._consecutive_errors = 0   # v9.0: cycle exception streak
         self._stop_submitted: Dict[str, datetime] = {}  # v9.2: stop-event dedupe (see STOP_RESUBMIT_SEC)
+        # 规则#50 (2026-08-24): 每日/每周完整报告的状态 (持久化于 state.json)
+        self._trades_log: List[Dict] = []           # 成交记录 [{date, text}]
+        self._equity_history: Dict[str, float] = {} # 每个报告日收盘净值 {date: equity}
+        self._last_daily_report: str = None         # 最近一次日报日期 (每日去重)
+        self._last_weekly_equity: float = None      # 上周报时净值 (周收益基准)
+        self._market_open_date: str = None          # 今天是否开过市 (收盘后判断用)
+        self._spy_inception_close: float = None     # SPY 2026-07-24 收盘 (累计基准, 缓存)
+        self._equity_at_last_rebalance: float = None
         self._load_state()
 
         # v8.5 (P1-3): startup reconciliation - cancel orphaned orders from a
@@ -3396,6 +3404,14 @@ class IntradayMonitor:
                     self.max_prices = data.get('max_prices', {})
                     # v8.5: peak/circuit/daily-baseline survive restarts
                     self.risk.load_state_dict(data)
+                    # 规则#50: 日报/周报状态
+                    self._trades_log = data.get('trades_log', [])
+                    self._equity_history = data.get('equity_history', {})
+                    self._last_daily_report = data.get('last_daily_report')
+                    self._last_weekly_equity = data.get('last_weekly_equity')
+                    self._market_open_date = data.get('market_open_date')
+                    self._spy_inception_close = data.get('spy_inception_close')
+                    self._equity_at_last_rebalance = data.get('equity_at_last_rebalance')
             except Exception as e:
                 # v8.5: a corrupt state must be visible, not silently swallowed
                 logger.error(f"State load failed ({e}) - starting with fresh state. "
@@ -3411,18 +3427,29 @@ class IntradayMonitor:
                 'entry_prices': self.entry_prices,
                 'max_prices': self.max_prices,
                 'last_save': now_et().isoformat(),
+                # 规则#50: 日报/周报状态 (有界截断, state.json 不膨胀)
+                'trades_log': self._trades_log[-200:],
+                'equity_history': dict(list(self._equity_history.items())[-80:]),
+                'last_daily_report': self._last_daily_report,
+                'last_weekly_equity': self._last_weekly_equity,
+                'market_open_date': self._market_open_date,
+                'spy_inception_close': self._spy_inception_close,
             }
             # v9.2 fix: preserve last_rebalance across saves. Previously each
             # _save_state rewrote state.json WITHOUT the stamp, so the
             # should_rebalance "already rebalanced today" check never fired
             # and do_rebalance re-ran EVERY cycle inside the window
             # (continuous re-optimization + fractional top-up churn).
+            # v9.3 fix: equity_at_last_rebalance (SPY weekly baseline) was
+            # dropped the same way - preserve it too.
             try:
                 if self.config.STATE_FILE.exists():
                     with open(self.config.STATE_FILE) as f:
                         _old = json.load(f)
                     if _old.get('last_rebalance'):
                         payload['last_rebalance'] = _old['last_rebalance']
+                    if _old.get('equity_at_last_rebalance'):
+                        payload['equity_at_last_rebalance'] = _old['equity_at_last_rebalance']
             except Exception:
                 pass
             payload.update(self.risk.state_dict())
@@ -3534,6 +3561,7 @@ class IntradayMonitor:
                 order = self.client.submit_order(sym, qty, 'sell')
                 if order and order.get('status') in ('filled', 'accepted', 'new'):
                     self._stop_submitted[sym] = _now
+                    self._record_trade(f"止损卖出 {sym} {qty}股 (P&L {pnl_pct:+.1%}, {reason})")
                     triggered += 1
                 else:
                     logger.error(f"Stop sell {sym} failed: {order}")
@@ -3636,22 +3664,22 @@ class IntradayMonitor:
             # data limit -> 429 storms and silently missing stocks).
             universe = [s for s in self.config.UNIVERSE if s != 'SPY'] + ['SPY']
 
-            # 规则#47 (2026-08-22): 调仓前必须确认价格数据最新。最新 bar 须为
-            # 今天或上一工作日；不新鲜则等 20s 重拉（最多 2 次），仍不新鲜则
-            # 中止本次调仓（不用过期数据生成信号）。不戳 last_rebalance，
-            # 下个周期自动重试。
+            # 规则#47 (2026-08-22, 2026-08-24 更新): 调仓前必须确认价格数据
+            # 最新。最新 bar 须为今天或上一工作日；不新鲜则等 20s 重拉
+            # （最多重试 3 次，用户指定），仍不新鲜则中止本次调仓（不用过期
+            # 数据生成信号）。不戳 last_rebalance，下个周期自动重试。
             prices = None
-            for _attempt in range(3):  # 首次 + 最多 2 次重拉
+            for _attempt in range(4):  # 首次 + 最多 3 次重拉
                 prices_data = self.client.get_bars_batch(universe, days=400)
                 prices = pd.DataFrame(prices_data).dropna(how='all').ffill()
                 if self._price_data_fresh(prices):
                     break
-                if _attempt < 2:
-                    logger.warning(f"Price data stale (attempt {_attempt + 1}/3), retrying in 20s...")
+                if _attempt < 3:
+                    logger.warning(f"Price data stale (attempt {_attempt + 1}/4), retrying in 20s...")
                     time.sleep(20)
             if not self._price_data_fresh(prices):
                 last_ts = prices.index[-1] if prices is not None and not prices.empty else 'N/A'
-                msg = (f"⛔ 价格数据不新鲜（最新bar: {last_ts}），重拉2次后仍未更新到今天/上一工作日，"
+                msg = (f"⛔ 价格数据不新鲜（最新bar: {last_ts}），重拉3次后仍未更新到今天/上一工作日，"
                        f"调仓中止。仓位保持不变，下周一自动重试。")
                 logger.critical(msg)
                 self.notifier.send(msg, key='stale_data_abort', min_interval=900)
@@ -3916,6 +3944,8 @@ class IntradayMonitor:
             # failure leaves the account possibly half-rotated, so the next
             # cycle retries instead of waiting a week.
             if not failures:
+                for _f in fills:  # 规则#50: 调仓成交进日报/周报汇总
+                    self._record_trade(_f)
                 self._save_state()
                 try:
                     with open(self.config.STATE_FILE) as f:
@@ -3990,6 +4020,143 @@ class IntradayMonitor:
         finally:
             self.risk.release_rebalance_lock()
     
+    # =========================================================================
+    # 规则#50 (2026-08-24): 每日 + 每周完整报告
+    #   日报: 每个交易日收盘后 (>=16:05 ET) 发一次 - 净值/当日收益/累计收益/
+    #         SPY 对照/持仓明细/当日成交
+    #   周报: 本周最后一个交易日随日报附发 (用 Alpaca clock 的 next_open 判断
+    #         下一交易日是否落在下周, 假日周自动提前) - 本周收益/本周成交汇总
+    # =========================================================================
+    def _record_trade(self, text: str):
+        """规则#50: 记录每笔账户变动, 供日报/周报汇总。"""
+        try:
+            self._trades_log.append({'date': now_et().date().isoformat(), 'text': text})
+            del self._trades_log[:-200]
+        except Exception as e:
+            logger.warning(f"trade record failed: {e}")
+
+    def _fetch_spy_series(self, days: int = 400) -> pd.Series:
+        """SPY 日线 (报告对照用); 失败返回空 Series, 报告相应行省略。"""
+        try:
+            data = self.client.get_bars_batch(['SPY'], days=days)
+            s = pd.Series(data.get('SPY', {})).dropna()
+            return s
+        except Exception as e:
+            logger.warning(f"SPY fetch for report failed: {e}")
+            return pd.Series(dtype=float)
+
+    def _spy_inception(self, spy: pd.Series):
+        """SPY 累计基准 (2026-07-24 收盘, paper 账户起点); 缓存于 state.json。"""
+        if self._spy_inception_close:
+            return self._spy_inception_close
+        spy0 = spy[spy.index <= '2026-07-24'] if len(spy) else spy
+        if len(spy0):
+            self._spy_inception_close = float(spy0.iloc[-1])
+        return self._spy_inception_close
+
+    def _holdings_lines(self, positions: List[Dict], equity: float) -> List[str]:
+        lines = []
+        stocks = [p for p in positions if p['symbol'] != self.config.HEDGE_ETF]
+        hedge = [p for p in positions if p['symbol'] == self.config.HEDGE_ETF]
+        for p in stocks:
+            sym = p['symbol']
+            qty = float(p['qty'])
+            entry = self.entry_prices.get(sym, float(p['avg_entry_price']))
+            cur = float(p['current_price'])
+            pl = (cur - entry) / entry if entry > 0 else 0
+            w = float(p['market_value']) / equity if equity > 0 else 0
+            lines.append(f"  {sym} {qty:g}股 ${cur:,.2f} ({pl:+.1%}) 仓位{w:.0%}")
+        for p in hedge:
+            lines.append(f"  [对冲] {p['symbol']} {float(p['qty']):g}股 "
+                         f"${float(p['current_price']):,.2f}")
+        if not lines:
+            lines.append("  （空仓）")
+        return lines
+
+    def _maybe_send_periodic_reports(self, clock: Dict, acct: Dict, positions: List[Dict]):
+        """每个 cycle 调用: 开市时记住日期; 收盘后每个交易日发日报(一次),
+        本周最后交易日附发周报。任何异常只记日志, 不影响交易主流程。"""
+        try:
+            now = now_et()
+            today = now.date().isoformat()
+            if clock.get('is_open'):
+                if self._market_open_date != today:
+                    self._market_open_date = today
+                return
+            # 收盘后窗口 16:05-23:30 ET; 今天须真的开过市 (排除周末/假日)
+            if not (dt_time(16, 5) <= now.time() <= dt_time(23, 30)):
+                return
+            if self._market_open_date != today or self._last_daily_report == today:
+                return
+
+            equity = float(acct.get('equity', 0) or 0)
+            cash = float(acct.get('cash', 0) or 0)
+            last_eq = float(acct.get('last_equity', 0) or 0)
+            spy = self._fetch_spy_series()
+
+            wd = ['周一', '周二', '周三', '周四', '周五', '周六', '周日'][now.weekday()]
+            lines = [f"📊 日报 {today} {wd}",
+                     f"Equity: ${equity:,.0f} | Cash: ${cash:,.0f}"]
+            # 当日收益: Alpaca last_equity 为昨收净值
+            if last_eq > 0:
+                day_r = equity / last_eq - 1
+                if len(spy) >= 2:
+                    day_spy = spy.iloc[-1] / spy.iloc[-2] - 1
+                    lines.append(f"当日: 策略 {day_r:+.1%} | SPY {day_spy:+.1%}")
+                else:
+                    lines.append(f"当日: 策略 {day_r:+.1%}")
+            # 累计收益 (7/24 起)
+            tot_r = equity / self.config.INITIAL_CAPITAL - 1
+            inc = self._spy_inception(spy)
+            if inc and len(spy):
+                tot_spy = spy.iloc[-1] / inc - 1
+                lines.append(f"累计(7/24起): 策略 {tot_r:+.1%} | SPY {tot_spy:+.1%}")
+            else:
+                lines.append(f"累计(7/24起): 策略 {tot_r:+.1%}")
+            # 持仓
+            lines.append("持仓:")
+            lines.extend(self._holdings_lines(positions, equity))
+            # 当日成交
+            todays = [t['text'] for t in self._trades_log if t['date'] == today]
+            lines.append("当日成交: " + ('; '.join(todays) if todays else "无"))
+            self.notifier.send('\n'.join(lines), key=f'daily_report_{today}', min_interval=0)
+            logger.info(f"daily report sent for {today}")
+
+            # 周报: 下一交易日落在下周 -> 今天是本周最后交易日
+            try:
+                nxt = pd.Timestamp(clock.get('next_open')).date()
+                this_wk = now.date().isocalendar()[:2]
+                if nxt.isocalendar()[:2] != this_wk:
+                    base = self._last_weekly_equity or self._equity_at_last_rebalance
+                    wk_lines = [f"📈 周报 {today} {wd} (本周最后交易日)"]
+                    if base:
+                        wk_r = equity / base - 1
+                        if len(spy) > 6:
+                            wk_spy = spy.iloc[-1] / spy.iloc[-6] - 1
+                            wk_lines.append(f"本周: 策略 {wk_r:+.1%} | SPY {wk_spy:+.1%}")
+                        else:
+                            wk_lines.append(f"本周: 策略 {wk_r:+.1%}")
+                    wk_lines.append(f"累计(7/24起): 策略 {tot_r:+.1%}")
+                    monday = (now.date() - timedelta(days=now.weekday())).isoformat()
+                    wk_trades = [f"  {t['date'][5:]} {t['text']}" for t in self._trades_log
+                                 if t['date'] >= monday]
+                    wk_lines.append("本周成交:")
+                    wk_lines.extend(wk_trades if wk_trades else ["  无"])
+                    wk_lines.append("持仓:")
+                    wk_lines.extend(self._holdings_lines(positions, equity))
+                    self.notifier.send('\n'.join(wk_lines),
+                                       key=f'weekly_report_{today}', min_interval=0)
+                    self._last_weekly_equity = equity
+                    logger.info(f"weekly report sent for week ending {today}")
+            except Exception as e:
+                logger.warning(f"weekly report failed: {e}")
+
+            self._last_daily_report = today
+            self._equity_history[today] = equity
+            self._save_state()
+        except Exception as e:
+            logger.warning(f"periodic report failed: {e}")
+
     def generate_report(self, positions: List[Dict]) -> str:
         acct = self.client.get_account()
         lines = []
@@ -4094,10 +4261,15 @@ class IntradayMonitor:
                                        key='liquidate', min_interval=0)
                     result = self.risk.emergency_liquidate(self.client)
                     self.risk._liquidated_for_circuit = True
+                    self._record_trade(f"紧急清仓({reason}): 成功{len(result.get('succeeded', []))}只 "
+                                       f"失败{len(result.get('failed', []))}只")
                     self._save_state()
                     self.notifier.send(f"🚨 清仓结果: 成功 {len(result.get('succeeded', []))} 只, "
                                        f"失败 {result.get('failed', [])}",
                                        key='liquidate_result', min_interval=0)
+            # 规则#50: 熔断/冷却期也要发日报 (此时用户最需要看到账户状态)
+            self._maybe_send_periodic_reports(self.client.get_clock() or {}, acct,
+                                              self.sync_positions())
             return
 
         # v8.3 (C2): market-hours gating. v8.2 ran stops and the hedge 24/7,
@@ -4140,6 +4312,9 @@ class IntradayMonitor:
         if (self.config.TRADING_ENABLED and market_open
                 and self._in_trading_window() and self.should_rebalance()):
             self.do_rebalance()
+
+        # === Step 3.5: 每日/每周完整报告 (规则#50, 收盘后每日一次) ===
+        self._maybe_send_periodic_reports(clock, acct, positions)
 
         # === Step 4: Report ===
         print(self.generate_report(self.sync_positions()))
