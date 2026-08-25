@@ -109,6 +109,7 @@ Usage:
 
 # Standard library
 import os
+import subprocess
 import sys
 import json
 import time
@@ -494,6 +495,11 @@ class Config:
     # must fetch enough history; 30 days silently disabled 3 of 4 strategies.
     MIN_DATA_DAYS: int = 252
     MIN_STOCKS_FOR_REBALANCE: int = 10
+    # 用户规则#47 (2026-08-22): 调仓前必须确认数据最新。PIT 基本面文件超过
+    # 此天数则在调仓前自动内联重建（build_pit_fundamentals.py），重建失败
+    # 则中止本次调仓（宁缺勿滥，不用过期基本面选股）。每周六 cron 正常重建
+    # 时 age<=7，10 天阈值只在 cron 失败时触发兜底。
+    PIT_MAX_AGE_DAYS: int = 10
 
     # === VIX data (v8.3: real VIX instead of VIXY x 0.85 proxy) ===
     VIX_CBOE_URL: str = "https://cdn.cboe.com/api/global/us_indices/daily_prices/VIX_History.csv"
@@ -3363,9 +3369,10 @@ class IntradayMonitor:
         pit_path = self.config.DATA_DIR / 'pit_fundamentals_full.json'
         if pit_path.exists():
             age_days = (time.time() - pit_path.stat().st_mtime) / 86400
-            if age_days > 7:
-                logger.warning(f"PIT fundamentals file is {age_days:.0f}d old - "
-                               f"re-run build_pit_fundamentals.py to refresh")
+            if age_days > self.config.PIT_MAX_AGE_DAYS:
+                logger.warning(f"PIT fundamentals file is {age_days:.0f}d old "
+                               f"(> PIT_MAX_AGE_DAYS={self.config.PIT_MAX_AGE_DAYS}) - "
+                               f"will be rebuilt inline at next rebalance (rule #47)")
             return PointInTimeFundamentals(self.config, pit_file=str(pit_path))
         logger.critical(f"PIT fundamentals missing ({pit_path}) - falling back to yfinance. "
                         f"Growth/value/defensive selection will differ from backtest!")
@@ -3553,6 +3560,49 @@ class IntradayMonitor:
         return True
     
     # HP-004 FIX: Use Config.UNIVERSE instead of hardcoded list
+    def _price_data_fresh(self, prices: pd.DataFrame) -> bool:
+        """规则#47: 最新价格 bar 必须是今天或上一个工作日（ET）。
+        容忍当日 bar 尚未发布、周末与假日；超过则认为数据源滞后。"""
+        if prices is None or prices.empty:
+            return False
+        last_date = prices.index[-1]
+        if hasattr(last_date, 'date'):
+            last_date = last_date.date()
+        today = datetime.now(ET).date()
+        weekdays = []
+        d = today
+        while len(weekdays) < 3:
+            if d.weekday() < 5:
+                weekdays.append(d)
+            d -= timedelta(days=1)
+        return last_date in weekdays[:2]
+
+    def _ensure_pit_fresh(self, failures: list) -> bool:
+        """规则#47: PIT 基本面超龄则调仓前自动重建并重载；失败返回 False（中止调仓）。
+        仅在使用 PointInTimeFundamentals 时适用（yfinance 回退为实时拉取，无龄期）。"""
+        if not isinstance(self.fundamentals, PointInTimeFundamentals):
+            return True
+        pit_path = self.config.DATA_DIR / 'pit_fundamentals_full.json'
+        age_days = (time.time() - pit_path.stat().st_mtime) / 86400 if pit_path.exists() else float('inf')
+        if age_days <= self.config.PIT_MAX_AGE_DAYS:
+            return True
+        logger.warning(f"PIT fundamentals {age_days:.0f}d old (> {self.config.PIT_MAX_AGE_DAYS}d) - "
+                       f"rebuilding inline before rebalance (rule #47)")
+        builder = Path(__file__).parent / 'build_pit_fundamentals.py'
+        try:
+            subprocess.run([sys.executable, str(builder)], timeout=600, check=True,
+                           cwd=str(Path(__file__).parent))
+            self.fundamentals = PointInTimeFundamentals(self.config, pit_file=str(pit_path))
+            logger.info("PIT fundamentals rebuilt and reloaded OK")
+            return True
+        except Exception as e:
+            msg = (f"⛔ PIT 基本面数据过期（{age_days:.0f}天）且自动重建失败（{type(e).__name__}: {e}），"
+                   f"调仓中止。仓位保持不变，下周一自动重试。")
+            logger.critical(msg)
+            self.notifier.send(msg, key='stale_pit_abort', min_interval=900)
+            failures.append('stale_pit')
+            return False
+
     def do_rebalance(self):
         """
         DCL EXECUTION: 先刷新数据 → 再生成信号 → 后下单
@@ -3585,14 +3635,37 @@ class IntradayMonitor:
             # per-symbol requests at ~6.7 req/s (over the 200 req/min free
             # data limit -> 429 storms and silently missing stocks).
             universe = [s for s in self.config.UNIVERSE if s != 'SPY'] + ['SPY']
-            prices_data = self.client.get_bars_batch(universe, days=400)
 
-            prices = pd.DataFrame(prices_data).dropna(how='all').ffill()
+            # 规则#47 (2026-08-22): 调仓前必须确认价格数据最新。最新 bar 须为
+            # 今天或上一工作日；不新鲜则等 20s 重拉（最多 2 次），仍不新鲜则
+            # 中止本次调仓（不用过期数据生成信号）。不戳 last_rebalance，
+            # 下个周期自动重试。
+            prices = None
+            for _attempt in range(3):  # 首次 + 最多 2 次重拉
+                prices_data = self.client.get_bars_batch(universe, days=400)
+                prices = pd.DataFrame(prices_data).dropna(how='all').ffill()
+                if self._price_data_fresh(prices):
+                    break
+                if _attempt < 2:
+                    logger.warning(f"Price data stale (attempt {_attempt + 1}/3), retrying in 20s...")
+                    time.sleep(20)
+            if not self._price_data_fresh(prices):
+                last_ts = prices.index[-1] if prices is not None and not prices.empty else 'N/A'
+                msg = (f"⛔ 价格数据不新鲜（最新bar: {last_ts}），重拉2次后仍未更新到今天/上一工作日，"
+                       f"调仓中止。仓位保持不变，下周一自动重试。")
+                logger.critical(msg)
+                self.notifier.send(msg, key='stale_data_abort', min_interval=900)
+                failures.append('stale_data')
+                return
 
             # === C: 数据校验 (Check) ===
             ok, reason = self.rebalancer.validate_data(prices)
             if not ok:
                 logger.warning(f"Rebalance skipped: {reason}")
+                return
+
+            # 规则#47: 价格新鲜后，再确认 PIT 基本面未超龄（超龄则自动重建）
+            if not self._ensure_pit_fresh(failures):
                 return
 
             stock_syms = [c for c in prices.columns if c != 'SPY']
