@@ -3573,19 +3573,35 @@ class IntradayMonitor:
         # v8.5: market calendar is judged in US Eastern, not host local time
         # (a UTC host shifted the Friday decision into Saturday).
         today = now_et()
-        if today.weekday() != self.config.REBALANCE_WEEKDAY:
-            return False
-        # Check if already rebalanced today
+        last_date = None
         if self.config.STATE_FILE.exists():
             try:
                 with open(self.config.STATE_FILE) as f:
                     data = json.load(f)
                     last = data.get('last_rebalance', '')
-                    if last and datetime.fromisoformat(last).date() == today.date():
-                        return False
-            except:
+                    if last:
+                        last_date = datetime.fromisoformat(last).date()
+            except (json.JSONDecodeError, OSError, ValueError, TypeError):
                 pass
-        return True
+        # Already rebalanced today
+        if last_date == today.date():
+            return False
+        if today.weekday() == self.config.REBALANCE_WEEKDAY:
+            return True
+        # P1 fix (audit 2026-08-26, approved): holiday-Monday catch-up.
+        # The anchor weekday being a market holiday (e.g. Labor Day 9/7)
+        # previously skipped the ENTIRE week (Tue-Fri never matched the
+        # anchor). Same gap when Monday's rebalance aborted (stale-data
+        # gate): no retry until next Monday. Now: if the last successful
+        # rebalance is >6 days old, the first open weekday catches up.
+        # run_cycle still gates on market_open, so holidays never fire.
+        # None (never rebalanced) keeps old behavior: wait for the anchor.
+        if (last_date is not None and (today.date() - last_date).days > 6
+                and today.weekday() < 5):
+            logger.info(f"Rebalance catch-up: last={last_date} (>6d), anchor missed - "
+                        f"rebalancing on first open weekday")
+            return True
+        return False
     
     # HP-004 FIX: Use Config.UNIVERSE instead of hardcoded list
     def _price_data_fresh(self, prices: pd.DataFrame) -> bool:
@@ -4073,9 +4089,11 @@ class IntradayMonitor:
             lines.append("  （空仓）")
         return lines
 
-    def _maybe_send_periodic_reports(self, clock: Dict, acct: Dict, positions: List[Dict]):
+    def _maybe_send_periodic_reports(self, clock: Dict, acct: Dict, positions: List[Dict],
+                                     note: str = None):
         """每个 cycle 调用: 开市时记住日期; 收盘后每个交易日发日报(一次),
-        本周最后交易日附发周报。任何异常只记日志, 不影响交易主流程。"""
+        本周最后交易日附发周报。note 用于标注特殊状态 (如 KILL SWITCH)。
+        任何异常只记日志, 不影响交易主流程。"""
         try:
             now = now_et()
             today = now.date().isoformat()
@@ -4095,7 +4113,7 @@ class IntradayMonitor:
             spy = self._fetch_spy_series()
 
             wd = ['周一', '周二', '周三', '周四', '周五', '周六', '周日'][now.weekday()]
-            lines = [f"📊 日报 {today} {wd}",
+            lines = [f"📊 日报 {today} {wd}" + (f" | {note}" if note else ""),
                      f"Equity: ${equity:,.0f} | Cash: ${cash:,.0f}"]
             # 当日收益: Alpaca last_equity 为昨收净值
             if last_eq > 0:
@@ -4230,7 +4248,14 @@ class IntradayMonitor:
                                key='kill_switch', min_interval=3600)
             if self.config.TRADING_ENABLED:
                 self.client.cancel_our_orders()
-            print(self.generate_report(self.sync_positions()))
+            positions = self.sync_positions()
+            print(self.generate_report(positions))
+            # 规则#50 (audit 2026-08-26 P1): kill switch 日也发日报 -
+            # 停交易的日子里用户最需要确认"系统在跑、仓位没变、为什么没动作"
+            acct = self.client.get_account()
+            if acct:
+                self._maybe_send_periodic_reports(self.client.get_clock() or {}, acct,
+                                                  positions, note='🛑 KILL SWITCH 生效中，未交易')
             return
 
         # === Step 0: Pre-trade risk check ===

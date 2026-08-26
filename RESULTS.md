@@ -17,6 +17,28 @@
 > its own same-data base). Numbers still carry survivorship bias
 > (2026-era constituents) and are an **overestimate** — see caveats.
 
+## Live ops: audit P1 fixes (deployed 2026-08-26, approved by user)
+
+From `全面审计报告_2026-08-26.md` (full-system audit, paper vs live):
+
+- **Holiday-Monday rebalance catch-up** (`should_rebalance`): the anchor
+  weekday being a market holiday (Labor Day 2026-09-07 was 12 days out)
+  previously skipped the whole week, and a Monday abort (stale-data gate)
+  had no retry until next Monday. Now: last successful rebalance >6 days
+  old → first open weekday catches up (still gated on `market_open`, so
+  holidays never fire). Fresh deploys (no stamp) keep waiting for the
+  anchor. 9/9 sim tests pass (`test_rebalance_catchup.py`).
+- **Process watchdog** (`tenbagger_watchdog.sh`, cron every 5 min): alerts
+  on Telegram when the service is not active (systemd gave up) or
+  monitor.out heartbeat is >180s old (hung but not crashed — systemd
+  Restart=on-failure does not cover hangs, and stops would silently stop
+  firing). Rate-limited 30 min.
+- **Kill-switch days still send the daily report** (annotated
+  "KILL SWITCH 生效中，未交易") — halted days are exactly when the user
+  needs confirmation the system is alive and positions untouched.
+- P2 hygiene in the same pass: bare `except:` in should_rebalance
+  narrowed to specific exceptions.
+
 ## Live ops: daily/weekly full reports (rule #50, deployed 2026-08-24)
 
 User rule #50: send a complete report every day and every week — rebalance
