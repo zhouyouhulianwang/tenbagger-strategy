@@ -83,6 +83,12 @@ GROUPS = {
         ('mp0', mk(MIN_SINGLE_POSITION_PCT=0.0)),
         ('mp5', BASE),
     ],
+    # informational only: interaction check of the two single-variable
+    # winners (rb30 + vt40). NOT a production candidate by itself —
+    # combining winners is a new search dimension (best-of-n risk).
+    'combo': [
+        ('rb30vt40', mk(STRATEGY_RESONANCE_BONUS=0.30, VOLATILITY_TARGET=0.40)),
+    ],
 }
 
 
