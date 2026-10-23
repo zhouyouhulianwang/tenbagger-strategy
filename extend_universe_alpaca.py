@@ -1,24 +1,32 @@
 #!/usr/bin/env python3
 """Extend all price histories to the latest available day via ALPACA
-(rule#2: Alpaca is the preferred data source). Replaces data/universe/*.csv
-and root SPY/SQQQ/VIX files with 2020-01-10 -> latest complete daily bar.
+(rule#2: Alpaca is the preferred data source). MERGE-APPEND mode:
+keeps every row of the existing CSVs and appends only Alpaca bars
+dated AFTER the old file's last row.
 
-Why not extend_universe.py (Nasdaq): on 2026-10-23 it returned data ending
-2026-07-31 only (stale endpoint). Alpaca batch daily bars (feed=iex,
-adjustment=all) are the same source the live monitor uses, so backtest and
-live see ONE data lineage going forward.
+Why merge-append (2026-10-23 finding): Alpaca IEX-feed daily history
+starts 2020-07-27, but our Nasdaq-sourced files start 2020-01-10.
+A full replace would silently drop the first ~6.5 months of 2020
+(139 trading days) — the COVID crash/recovery the honest baseline
+depends on. Merge-append preserves the old lineage 2020-01-10 ->
+2026-07-29 and stitches Alpaca IEX bars 2026-07-30 -> latest.
+
+Why not extend_universe.py (Nasdaq): on 2026-10-23 it returned data
+ending 2026-07-31 only (stale endpoint). Alpaca batch daily bars
+(feed=iex, adjustment=all) are the same source the live monitor uses,
+so backtest and live see ONE data lineage going forward.
 
 Validation (per standing rule: verify before overwrite):
-  - rows_new >= rows_old
-  - new file ends >= old file end date
   - overlap closes (last 20 common days) median abs diff < 0.5%
     (IEX daily close vs Nasdaq official close tolerance)
-Files failing validation are NOT replaced; reported in
-data/universe/_extend_validation.json.
+  - merged rows > old rows, merged end > old end
+  - on ANY failure the old file is left untouched
+Report: data/universe/_extend_validation.json
+Categories: extended / new_file / current / failed / empty.
 
-Volume note: IEX-feed volume is ~2-3% of consolidated. Production config
-has MIN_ADV_SHARES=0 (volume filters OFF), so volume comparability does
-not affect the strategy; closes are what matter.
+Volume note: IEX-feed volume is ~2-3% of consolidated. Production
+config has MIN_ADV_SHARES=0 (volume filters OFF), so volume
+comparability does not affect the strategy; closes are what matter.
 
 Run on the server (Alpaca creds in /root/.tenbagger-env):
   cd /data/tenbagger && source /root/.tenbagger-env && \
@@ -47,7 +55,6 @@ MAX_DIFF_PCT = 0.5
 
 def fetch_raw(client, symbols):
     """Paginated raw bars (o/h/l/c/v) for all symbols, 2020 -> now."""
-    import requests  # noqa
     end = pd.Timestamp.now()
     start = pd.Timestamp(MIN_DATE)
     url = f"{client.config.ALPACA_DATA_URL}/v2/stocks/bars"
@@ -85,31 +92,45 @@ def fetch_raw(client, symbols):
 
 def bars_to_df(bars):
     df = pd.DataFrame(bars)
-    df['t'] = pd.to_datetime(df['t']).dt.tz_localize(None)
+    # IEX daily bars are timestamped 05:00 UTC (= ET midnight); normalize
+    # to a plain date so rows match the existing CSV format exactly.
+    df['t'] = pd.to_datetime(df['t']).dt.tz_localize(None).dt.normalize()
     df = df.rename(columns={'t': 'Date', 'o': 'Open', 'h': 'High',
                             'l': 'Low', 'c': 'Close', 'v': 'Volume'})
     df = df[['Date', 'Open', 'High', 'Low', 'Close', 'Volume']]
     return df.set_index('Date').sort_index()
 
 
-def validate(old_path, new_df):
-    """Return (ok, reason)."""
+def merge_append(old_path, new_df):
+    """Return (merged_df or None, category, reason)."""
     if not os.path.exists(old_path):
-        return True, 'new file'
+        return new_df, 'new_file', 'new file'
     old = pd.read_csv(old_path, index_col=0, parse_dates=True)
-    if len(new_df) < len(old):
-        return False, f'rows {len(new_df)} < old {len(old)}'
-    if new_df.index[-1] < old.index[-1]:
-        return False, f'ends {new_df.index[-1].date()} < old {old.index[-1].date()}'
+    old.index = pd.to_datetime(old.index).normalize()
+    old = old[~old.index.duplicated(keep='last')].sort_index()
+    new_df = new_df[~new_df.index.duplicated(keep='last')]
+
     common = old.index.intersection(new_df.index)
+    med = None
     if len(common) >= 20:
-        common = common[-20:]
-        diff = (new_df.loc[common, 'Close'] / old.loc[common, 'Close'] - 1).abs() * 100
+        chk = common[-20:]
+        diff = (new_df.loc[chk, 'Close'] / old.loc[chk, 'Close'] - 1).abs() * 100
         med = float(diff.median())
         if med > MAX_DIFF_PCT:
-            return False, f'overlap median diff {med:.3f}% > {MAX_DIFF_PCT}%'
-        return True, f'overlap diff {med:.3f}%'
-    return True, 'short overlap'
+            return None, 'failed', f'overlap median diff {med:.3f}% > {MAX_DIFF_PCT}%'
+
+    tail = new_df[new_df.index > old.index[-1]]
+    if tail.empty:
+        return None, 'current', f'already ends {old.index[-1].date()}'
+    merged = pd.concat([old, tail])
+    if len(merged) <= len(old):
+        return None, 'failed', 'merged not longer than old'
+    reason = f'+{len(tail)} rows -> {merged.index[-1].date()}'
+    if med is not None:
+        reason += f' (overlap diff {med:.3f}%)'
+    else:
+        reason += ' (short overlap)'
+    return merged, 'extended', reason
 
 
 def main():
@@ -118,7 +139,8 @@ def main():
     symbols = list(cfg.UNIVERSE) + ['SQQQ']  # SPY already in UNIVERSE
     collected = fetch_raw(client, symbols)
 
-    report = {'replaced': [], 'kept_old': [], 'empty': []}
+    report = {'extended': [], 'new_file': [], 'current': [],
+              'failed': [], 'empty': []}
     for sym in symbols:
         bars = collected.get(sym) or []
         path = os.path.join(UNI, f'{sym}.csv')
@@ -128,12 +150,10 @@ def main():
             report['empty'].append(sym)
             continue
         new_df = bars_to_df(bars)
-        ok, reason = validate(path, new_df)
-        if ok:
-            new_df.to_csv(path)
-            report['replaced'].append(f'{sym} -> {new_df.index[-1].date()} ({reason})')
-        else:
-            report['kept_old'].append(f'{sym}: {reason}')
+        merged, cat, reason = merge_append(path, new_df)
+        if merged is not None:
+            merged.to_csv(path)
+        report[cat].append(f'{sym}: {reason}')
 
     # VIX: CBOE official history
     try:
@@ -150,12 +170,11 @@ def main():
 
     with open(os.path.join(UNI, '_extend_validation.json'), 'w') as f:
         json.dump(report, f, indent=1, ensure_ascii=False)
-    print(f"replaced={len(report['replaced'])} kept_old={len(report['kept_old'])} "
-          f"empty={len(report['empty'])}", flush=True)
-    if report['kept_old']:
-        print('kept_old:', *report['kept_old'][:20], sep='\n  ')
-    if report['empty']:
-        print('empty:', report['empty'])
+    print(' '.join(f'{k}={len(v)}' for k, v in report.items()
+                   if isinstance(v, list)), flush=True)
+    for cat in ('failed', 'empty'):
+        if report[cat]:
+            print(f'{cat}:', *report[cat][:20], sep='\n  ')
 
 
 if __name__ == '__main__':
