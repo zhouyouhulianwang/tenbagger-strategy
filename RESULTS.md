@@ -276,3 +276,46 @@ python build_pit_fundamentals.py                              # PIT snapshots  -
 python tenbagger_v8_2_production.py --mode backtest                    # 10-stock dev universe
 python tenbagger_v8_2_production.py --mode backtest --universe full    # full pool
 ```
+
+## Optimization battery (2026-10-23, data extended to 2026-10-22)
+
+Data lineage fix first (rule#4): `extend_universe_alpaca.py` v3 —
+merge-append + split-stitch. Verified old CSVs are Nasdaq RAW prices
+(match Alpaca adjustment='raw' at 0.023% median overlap); Alpaca IEX
+history starts 2020-07-27 so full replace would have dropped 139
+early-2020 trading days. 491 files extended, 30 created, 0 failures.
+APH/MNST 2:1 gap splits stitched (factor 0.5).
+
+18 single-variable variants, 6 never-scanned knobs, honest data
+2020-01 -> 2026-10-22 (includes the Aug-Oct 2026 live loss window).
+Base re-run on extended data: **343.9% / 1.23 / -30.3%**
+(was 432.6/1.41/-30.3 on data to 2026-07-29; the delta IS the loss period).
+
+| variant | ret% | sharpe | mdd% | seg20-23 | seg24-26 | verdict |
+|---|---|---|---|---|---|---|
+| base | 343.9 | 1.23 | -30.3 | 91.2 | 133.0 | — |
+| **resonance/rb30** | **403.8** | **1.33** | **-22.6** | 96.0 | 158.0 | **WIN** (max yearly hole 5.1pp) |
+| resonance/rb00 | 365.3 | 1.29 | -21.3 | 98.1 | 134.6 | reject: 2024 hole 23.6pp |
+| **voltarget/vt40** | **389.8** | **1.28** | **-22.7** | 94.5 | 151.9 | **WIN** (max yearly hole 6.8pp) |
+| resonance/rb10 | 339.9 | 1.24 | -29.0 | 107.8 | 112.5 | reject: 2024 hole 19.7pp |
+| voltarget/vt20 | 342.0 | 1.23 | -30.3 | 81.6 | 144.9 | tie |
+| rsmin all | ~340 | 1.22-1.23 | ~-30 | — | — | tie |
+| voltarget/vt30 | 324.4 | 1.19 | -30.2 | 83.7 | 130.9 | lose |
+| voltarget/vt15 | 303.9 | 1.16 | -30.3 | 62.0 | 151.0 | lose |
+| cycle/d10 | 223.1 | 1.03 | -23.6 | 92.0 | 68.3 | lose |
+| volgate/vg50 | 183.8 | 0.98 | -25.4 | 59.4 | 84.9 | lose |
+| cycle/d15 | 173.5 | 0.95 | -26.6 | 87.1 | 48.4 | lose |
+| minpos/mp0 | 204.7 | 0.95 | -30.1 | 34.7 | 127.1 | lose |
+| cycle/d3 | 187.2 | 0.90 | -30.6 | 69.8 | 72.7 | lose |
+| volgate/vg75 | 107.6 | 0.65 | -34.9 | 78.3 | 16.0 | lose |
+| cycle/d20 | 66.0 | 0.56 | -28.2 | 37.1 | 21.5 | lose |
+| combo rb30+vt40 | 197.4 | 0.94 | -29.5 | 94.1 | 56.7 | **negative interaction — never combine** |
+
+Recent-window check (2026-08-24 -> 2026-10-22, the live loss window):
+base -8.5%, rb30 -8.5%, vt40 -8.1% (live paper account: -12.9%).
+**Neither winner fixes the whipsaw regime** — their edge is long-run
+(2023 +11pp, 2025 +12.5pp for rb30), not crash/whipsaw protection.
+
+Production candidates pending user approval (rule#5):
+- `STRATEGY_RESONANCE_BONUS` 0.20 -> 0.30 (multi-strategy consensus weight)
+- `VOLATILITY_TARGET` 0.25 -> 0.40 (less vol-penalty in sizing)
