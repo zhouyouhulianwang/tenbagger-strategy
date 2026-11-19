@@ -319,3 +319,19 @@ base -8.5%, rb30 -8.5%, vt40 -8.1% (live paper account: -12.9%).
 Production candidates pending user approval (rule#5):
 - `STRATEGY_RESONANCE_BONUS` 0.20 -> 0.30 (multi-strategy consensus weight)
 - `VOLATILITY_TARGET` 0.25 -> 0.40 (less vol-penalty in sizing)
+
+### Re-validation on fresher data (2026-11-19, data to 2026-11-18)
+
+Config deployed 10/23 but user approval arrived 11/19; per rule#4/#6 the
+winner was re-validated before staying live. CAUTION: with the new value
+already deployed, Config() defaults to 0.30 — the old base must be pinned
+explicitly (mk(STRATEGY_RESONANCE_BONUS=0.20)); the first revalidation
+run was contaminated by this and discarded.
+
+| config | ret% | sharpe | mdd% | seg20-23 | seg24-26 | max yearly hole |
+|---|---|---|---|---|---|---|
+| old base (0.20) | 320.5 | 1.18 | -30.3 | 91.2 | 120.7 | — |
+| rb30 (0.30) | 377.3 | 1.27 | -23.2 | 96.0 | 144.4 | 5.1pp |
+
+Winner CONFIRMED on fresh data (+56.8pp, Sharpe +0.09, MDD -7.1pp).
+Deployment stands (v9.4, commit 1131830). vt40 still deferred 1-2 weeks.
