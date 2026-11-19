@@ -474,7 +474,11 @@ class Config:
     WEIGHT_PANIC: Dict[str, float] = field(default_factory=lambda: {
         'momentum': 0.05, 'sector': 0.10, 'growth': 0.0, 'value': 0.20, 'defensive': 0.50
     })
-    STRATEGY_RESONANCE_BONUS: float = 0.20
+    # v9.4 (2026-10-23, user-approved): 0.20 -> 0.30. Battery winner rb30:
+    # 403.8%/1.33/-22.6% vs base 343.9/1.23/-30.3 (2020-01->2026-10-22),
+    # max yearly hole 5.1pp. Does NOT help whipsaw regimes (8/24-10/22
+    # window: -8.5% same as base). See RESULTS.md "Optimization battery".
+    STRATEGY_RESONANCE_BONUS: float = 0.30
     
     # === API ===
     # v8.5: base URL comes from the environment so paper<->live switching
